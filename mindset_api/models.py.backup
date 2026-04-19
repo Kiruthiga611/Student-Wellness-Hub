@@ -1,0 +1,1214 @@
+from django.db import models
+from django.contrib.auth.models import User
+from django.core.validators import MinValueValidator, MaxValueValidator
+from django.utils import timezone
+from datetime import timedelta
+import json
+
+
+# ==================== ACADEMIC CALENDAR ====================
+
+class AcademicEvent(models.Model):
+    """
+    Academic Calendar Events for Context-Aware Insights.
+    
+    Tracks academic periods (exams, deadlines, breaks) to provide
+    context-aware recommendations and understand student stress patterns.
+    """
+    event_name = models.CharField(
+        max_length=200,
+        help_text="Name of the academic event (e.g., 'Final Exams', 'Project Deadline')"
+    )
+    start_date = models.DateField(
+        help_text="Event start date"
+    )
+    end_date = models.DateField(
+        help_text="Event end date"
+    )
+    description = models.TextField(
+        blank=True,
+        help_text="Optional event description"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def is_active_on(self, check_date=None):
+        """Check if this event is active on a given date."""
+        if check_date is None:
+            check_date = timezone.now().date()
+        return self.start_date <= check_date <= self.end_date
+
+    def __str__(self):
+        return f"{self.event_name} ({self.start_date} to {self.end_date})"
+
+    class Meta:
+        ordering = ['start_date']
+        verbose_name = 'Academic Event'
+        verbose_name_plural = 'Academic Events'
+        indexes = [
+            models.Index(fields=['start_date', 'end_date']),
+        ]
+
+
+# ==================== MENTAL HEALTH TRACKING ====================
+
+class MoodEntry(models.Model):
+    """
+    Mental Health Mood Entry — Data Fusion Engine.
+
+    Combines three signals to produce reliable DAS levels:
+
+      Layer 1 – TextBlob AI:          raw sentiment polarity from free-text note
+      Layer 2 – Keyword tuning:       academic stressor words lower the score by 0.2,
+                                      catching neutral sentences like "I have an exam"
+                                      that TextBlob otherwise scores as 0.0
+      Layer 3 – Ground-truth gate:    if AI is still neutral (−0.1 … +0.1) but the
+                                      student explicitly chose ANX or STR, the user's
+                                      explicit selection overrides AI to set the
+                                      relevant DAS level to 'High'
+
+    This three-layer approach means DAS fields are NEVER empty:
+    if there is no note at all, the user_selected_mood alone drives the levels.
+    """
+
+    # ── Mood choice constants ─────────────────────────────────────────
+    MOOD_SAD = 'SAD'
+    MOOD_ANX = 'ANX'
+    MOOD_STR = 'STR'
+    MOOD_HAP = 'HAP'
+    MOOD_NEU = 'NEU'
+
+    MOOD_CHOICES = [
+        (MOOD_SAD, 'Sad / Low'),
+        (MOOD_ANX, 'Anxious'),
+        (MOOD_STR, 'Stressed'),
+        (MOOD_HAP, 'Happy'),
+        (MOOD_NEU, 'Neutral'),
+    ]
+
+    DAS_CHOICES = [
+        ('Low',      'Low'),
+        ('Moderate', 'Moderate'),
+        ('High',     'High'),
+    ]
+
+    # Academic stressor keywords for Layer 2 tuning.
+    # Extend this list freely; no migration needed.
+    ACADEMIC_STRESSORS = [
+        'exam', 'exams', 'test', 'quiz',
+        'grades', 'grade', 'gpa',
+        'deadline', 'deadlines', 'due',
+        'fail', 'failed', 'failing',
+        'assignment', 'project', 'finals', 'midterm',
+        'presentation', 'submit', 'submission',
+    ]
+    STRESSOR_PENALTY = 0.2   # subtracted from sentiment_score when a keyword is found
+
+    # ── Core fields ───────────────────────────────────────────────────
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='mood_entries',
+        help_text="Student who logged this mood"
+    )
+    timestamp = models.DateTimeField(
+        auto_now_add=True, help_text="When this mood was logged"
+    )
+    note = models.TextField(
+        blank=True, help_text="Free-text mood description (optional)"
+    )
+
+    # ── Layer 3 input: explicit user selection ─────────────────────────
+    user_selected_mood = models.CharField(
+        max_length=3, choices=MOOD_CHOICES, default=MOOD_NEU,
+        help_text="Student's explicit mood choice: SAD, ANX, STR, HAP, or NEU"
+    )
+
+    # ── Fused output fields (always populated after save) ─────────────
+    sentiment_score = models.FloatField(
+        null=True, blank=True,
+        help_text="Tuned sentiment score after keyword penalty (−1 to 1). "
+                  "Null only when no note AND no explicit mood provided."
+    )
+    depression_level = models.CharField(
+        max_length=20, choices=DAS_CHOICES, default='Low',
+        help_text="Fused depression level — never empty"
+    )
+    anxiety_level = models.CharField(
+        max_length=20, choices=DAS_CHOICES, default='Low',
+        help_text="Fused anxiety level — never empty"
+    )
+    stress_level = models.CharField(
+        max_length=20, choices=DAS_CHOICES, default='Low',
+        help_text="Fused stress level — never empty"
+    )
+
+    # ── Private helpers ───────────────────────────────────────────────
+
+    def _apply_keyword_tuning(self, score, note_lower):
+        """
+        Layer 2 — Keyword Override.
+
+        Searches the lowercased note for academic stressor words.
+        Subtracts STRESSOR_PENALTY (0.2) if any keyword is found,
+        clamping the result to the valid range [−1.0, 1.0].
+
+        This prevents TextBlob's neutral 0.0 from masking real stress
+        in sentences like "I have an exam tomorrow and feel okay."
+        """
+        words = set(note_lower.split())
+        if words & set(self.ACADEMIC_STRESSORS):
+            score = max(score - 0.2, -1.0)  # "grades" found → 0.0 becomes -0.2
+        return score
+
+
+    def _das_from_score(self, score):
+        """
+        Layer 1+2 — Threshold mapping from tuned sentiment score to DAS levels.
+
+        Thresholds are intentionally asymmetric: anxiety triggers earlier
+        (needs a less negative score to reach High) because academic anxiety
+        often presents with mildly negative rather than strongly negative text.
+        """
+        # Depression
+        if score >= 0.1:
+            depression = 'Low'
+        elif score >= -0.3:
+            depression = 'Moderate'
+        else:
+            depression = 'High'
+
+        # Anxiety — triggers earlier than depression
+        if score >= 0.1:
+            anxiety = 'Low'
+        elif score >= -0.1:
+            anxiety = 'Moderate'
+        else:
+            anxiety = 'High'
+
+        # Stress
+        if score >= 0.05:
+            stress = 'Low'
+        elif score >= -0.35:
+            stress = 'Moderate'
+        else:
+            stress = 'High'
+
+        return depression, anxiety, stress
+
+    def _apply_ground_truth_gate(self, depression, anxiety, stress):
+        """
+        Layer 3 — Ground-Truth Validation Gate.
+
+        If AI+keyword tuning produces a neutral result (score close to 0)
+        but the student explicitly chose ANX or STR, the student's direct
+        self-report is more reliable than the text analysis.
+
+        Rules:
+          user_selected_mood == ANX  →  force anxiety_level  to 'High'
+          user_selected_mood == STR  →  force stress_level   to 'High'
+          user_selected_mood == SAD  →  force depression_level to 'High'
+                                        and stress_level to 'Moderate' minimum
+          user_selected_mood == HAP  →  cap levels at 'Low'
+                                        (student says they are fine)
+        """
+        mood = self.user_selected_mood
+
+        if mood == self.MOOD_ANX:
+            anxiety = 'High'
+
+        elif mood == self.MOOD_STR:
+            stress = 'High'
+            # Stressed students typically show at least moderate anxiety
+            if anxiety == 'Low':
+                anxiety = 'Moderate'
+
+        elif mood == self.MOOD_SAD:
+            depression = 'High'
+            if stress == 'Low':
+                stress = 'Moderate'
+
+        elif mood == self.MOOD_HAP:
+            # Student reports happiness — trust them; cap everything at Low
+            depression = 'Low'
+            anxiety    = 'Low'
+            stress     = 'Low'
+
+        # MOOD_NEU: no override; AI result stands
+
+        return depression, anxiety, stress
+
+    def _das_from_mood_only(self):
+        """
+        Fallback when there is no note at all — derive DAS purely from
+        the user_selected_mood so DAS fields are never left empty.
+        """
+        mapping = {
+            self.MOOD_SAD: ('High',     'Moderate', 'Moderate'),
+            self.MOOD_ANX: ('Moderate', 'High',     'Moderate'),
+            self.MOOD_STR: ('Moderate', 'Moderate', 'High'),
+            self.MOOD_HAP: ('Low',      'Low',      'Low'),
+            self.MOOD_NEU: ('Low',      'Low',      'Low'),
+        }
+        return mapping.get(self.user_selected_mood, ('Low', 'Low', 'Low'))
+
+    # ── Model save ────────────────────────────────────────────────────
+
+    def save(self, *args, **kwargs):
+        """
+        Data-Fusion Engine — runs on every create or update.
+
+        Pipeline:
+          1. TextBlob raw score  (Layer 1)
+          2. Keyword penalty     (Layer 2)
+          3. Threshold → DAS     (Layer 1+2)
+          4. Ground-truth gate   (Layer 3)
+        """
+        if self.note:
+            try:
+                from textblob import TextBlob
+
+                # Layer 1 — raw AI sentiment
+                raw_score = float(TextBlob(self.note).sentiment.polarity)
+
+                # Layer 2 — keyword tuning
+                tuned_score = self._apply_keyword_tuning(
+                    raw_score, self.note.lower()
+                )
+                self.sentiment_score = round(tuned_score, 4)
+
+                # Layer 1+2 — threshold mapping
+                depression, anxiety, stress = self._das_from_score(tuned_score)
+
+            except Exception:
+                # TextBlob unavailable — fall through to mood-only path
+                self.sentiment_score = None
+                depression, anxiety, stress = self._das_from_mood_only()
+
+        else:
+            # No note — derive DAS entirely from user's explicit choice
+            self.sentiment_score = None
+            depression, anxiety, stress = self._das_from_mood_only()
+
+        # Layer 3 — ground-truth gate (runs regardless of whether note exists)
+        depression, anxiety, stress = self._apply_ground_truth_gate(
+            depression, anxiety, stress
+        )
+
+        self.depression_level = depression
+        self.anxiety_level    = anxiety
+        self.stress_level     = stress
+
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return (
+            f"{self.user.username} [{self.get_user_selected_mood_display()}] "
+            f"— D:{self.depression_level} A:{self.anxiety_level} S:{self.stress_level} "
+            f"@ {self.timestamp.strftime('%Y-%m-%d %H:%M')}"
+        )
+
+    class Meta:
+        ordering = ['-timestamp']
+        verbose_name = 'Mood Entry'
+        verbose_name_plural = 'Mood Entries'
+
+
+# ==================== SLEEP TRACKING ====================
+from django.db import models
+from django.core.validators import MinValueValidator, MaxValueValidator
+from django.contrib.auth.models import User
+from datetime import datetime
+from django.utils import timezone
+class SleepLog(models.Model):
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='sleep_logs',
+        help_text="Student tracking their sleep"
+    )
+    date = models.DateField(help_text="Date of sleep (e.g., night of Feb 10)")
+    
+    # NEW FIELDS: From, To, and Interruptions
+    sleep_from = models.TimeField(null=True, blank=True, help_text="Time you went to bed")
+    sleep_to = models.TimeField(null=True, blank=True, help_text="Time you woke up")
+    interruption_count = models.PositiveIntegerField(default=0, help_text="Number of times sleep was interrupted")
+    
+    # Updated to be auto-calculated
+    hours_slept = models.FloatField(
+        validators=[MinValueValidator(0.0), MaxValueValidator(24.0)],
+        default=0.0,
+        help_text="Total hours (auto-calculated from From/To)"
+    )
+    
+    # NEW FIELD: Sleep Quality Tag (Replaces the hyphen in your UI)
+    quality_tag = models.CharField(
+        max_length=20, 
+        default="-", 
+        help_text="Good, Poor, or Not Bad"
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    def save(self, *args, **kwargs):
+    # 1. Calculate hours_slept (keep the decimal for backend calculations)
+        if self.sleep_from and self.sleep_to:
+            start = datetime.combine(self.date, self.sleep_from)
+            end = datetime.combine(self.date, self.sleep_to)
+            if end <= start:
+                from datetime import timedelta
+                end += timedelta(days=1)
+        
+            diff = end - start
+            self.hours_slept = round(diff.total_seconds() / 3600, 2)
+    
+    # 2. Determine Quality Tag
+        if self.hours_slept >= 7 and self.interruption_count <= 1:
+            self.quality_tag = "Good"
+        elif self.hours_slept < 5 or self.interruption_count >= 3:
+            self.quality_tag = "Poor"
+        else:
+            self.quality_tag = "Not Bad"
+    
+        super().save(*args, **kwargs)
+
+# ADD THIS NEW METHOD
+    def get_duration_display(self):
+        """Return sleep duration in user-friendly format: '6h 40m'"""
+        if not self.hours_slept:
+            return "0h 0m"
+    
+        hours = int(self.hours_slept)
+        minutes = int((self.hours_slept - hours) * 60)
+        return f"{hours}h {minutes}m"
+
+    def __str__(self):
+        return f"{self.user.username} - {self.quality_tag} ({self.get_duration_display()}) on {self.date}"
+    
+    class Meta:
+        ordering = ['-date']
+        verbose_name = 'Sleep Log'
+        verbose_name_plural = 'Sleep Logs'
+        unique_together = ['user', 'date']
+
+
+# ==================== STUDY TRACKING ====================
+
+class StudySession(models.Model):
+    """
+    Study Session Tracker (Samsung Health-inspired).
+    
+    Records study sessions with automatic duration calculation.
+    Helps monitor academic engagement and prevent burnout.
+    """
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='study_sessions',
+        help_text="Student logging the study session"
+    )
+    subject = models.CharField(
+        max_length=200,
+        help_text="Subject or topic studied (e.g., 'Mathematics', 'Python Programming')"
+    )
+    start_time = models.DateTimeField(
+        help_text="When the study session started"
+    )
+    end_time = models.DateTimeField(
+        help_text="When the study session ended"
+    )
+    duration_minutes = models.IntegerField(
+        editable=False,
+        help_text="Auto-calculated duration in minutes"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        """Auto-calculate duration on save."""
+        if self.start_time and self.end_time:
+            delta = self.end_time - self.start_time
+            self.duration_minutes = int(delta.total_seconds() / 60)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.user.username} - {self.subject} ({self.duration_minutes} mins)"
+
+    class Meta:
+        ordering = ['-start_time']
+        verbose_name = 'Study Session'
+        verbose_name_plural = 'Study Sessions'
+        indexes = [
+            models.Index(fields=['user', 'start_time']),
+        ]
+
+
+# ==================== WELLNESS RESOURCES ====================
+
+class WellnessResource(models.Model):
+    """
+    Wellness Resource Catalogue — powers the Samsung Health-style carousel.
+
+    Each row represents one card the frontend can render.  Admins curate
+    this table via the Django admin panel; the WellnessSummaryView queries
+    it at runtime and returns a ranked subset as `recommended_resources`.
+
+    Filtering tags (comma-separated in the `tags` field) let the engine
+    surface the right cards without storing category-specific logic in Python.
+    Example tag strings:
+        "breathing,anxiety,stress"
+        "sleep,recovery,hygiene"
+        "focus,study,pomodoro"
+        "journal,mood,gratitude"
+    """
+
+    CATEGORY_CHOICES = [
+        ('Mood',     'Mood'),
+        ('Focus',    'Focus'),
+        ('Recovery', 'Recovery'),
+    ]
+
+    # ── Content fields ────────────────────────────────────────────────
+    title    = models.CharField(
+                   max_length=200,
+                   help_text="Card headline shown in the carousel, e.g. 'Box Breathing'")
+    category = models.CharField(
+                   max_length=20, choices=CATEGORY_CHOICES,
+                   help_text="Wellness pillar this card belongs to")
+    image_url    = models.URLField(
+                       blank=True,
+                       help_text="Thumbnail URL displayed on the card face")
+    content_link = models.URLField(
+                       help_text="URL or deep-link opened when the student taps the card")
+
+    # ── Frontend rendering hints ──────────────────────────────────────
+    # Stored here so the frontend never hard-codes presentation logic.
+    color  = models.CharField(
+                 max_length=10, default='#4A90D9',
+                 help_text="Hex background colour for the card, e.g. '#4A3728'")
+    action = models.CharField(
+                 max_length=80, default='open',
+                 help_text="Action token the frontend routes on: 'breathe', "
+                           "'journal', 'sleep_tips', 'meditate', 'focus'")
+
+    # ── Recommendation engine metadata ───────────────────────────────
+    tags = models.CharField(
+               max_length=300, blank=True,
+               help_text="Comma-separated filter tags used by the recommendation "
+                         "engine, e.g. 'breathing,stress,anxiety'")
+    priority = models.PositiveSmallIntegerField(
+                   default=100,
+                   help_text="Lower = shown earlier within its slot. "
+                             "Used as a tie-breaker when multiple cards match a rule.")
+
+    is_active = models.BooleanField(
+                    default=True,
+                    help_text="Inactive cards are never returned by the API")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def tag_list(self):
+        """Return the tags field as a cleaned Python list of lowercase strings."""
+        return [t.strip().lower() for t in self.tags.split(',') if t.strip()]
+
+    def as_card(self):
+        """
+        Return the dict shape the frontend maps directly to a Card component.
+        This is the exact format returned inside `recommended_resources`.
+        """
+        return {
+            'title':        self.title,
+            'category':     self.category,
+            'color':        self.color,
+            'action':       self.action,
+            'image_url':    self.image_url,
+            'content_link': self.content_link,
+        }
+
+    def __str__(self):
+        return f"[{self.category}] {self.title}"
+
+    class Meta:
+        ordering = ['priority', 'category', 'title']
+        verbose_name = 'Wellness Resource'
+        verbose_name_plural = 'Wellness Resources'
+        indexes = [
+            models.Index(fields=['category', 'is_active']),
+        ]
+
+# ==================== USER PERSONALIZATION & GAMIFICATION ====================
+
+class UserStats(models.Model):
+    """
+    User Statistics & Streaks (Gamification Layer).
+    
+    Tracks engagement patterns, streaks, and behavioral insights
+    to provide personalized encouragement and pattern detection.
+    """
+    user = models.OneToOneField(
+        User, on_delete=models.CASCADE, related_name='stats'
+    )
+    
+    # Streak tracking
+    current_streak = models.IntegerField(
+        default=0,
+        help_text="Current consecutive days of check-ins"
+    )
+    longest_streak = models.IntegerField(
+        default=0,
+        help_text="Longest streak ever achieved"
+    )
+    last_checkin_date = models.DateField(
+        null=True, blank=True,
+        help_text="Last date user logged any entry"
+    )
+    total_checkins = models.IntegerField(
+        default=0,
+        help_text="Total number of mood entries logged"
+    )
+    
+    # Feature usage tracking
+    features_used = models.JSONField(
+        default=dict,
+        help_text="Count of feature usage: {'mood': 45, 'sleep': 30, 'breathing': 12}"
+    )
+    
+    # Personal bests
+    best_health_score = models.FloatField(
+        default=0.0,
+        help_text="Highest health score achieved"
+    )
+    best_health_score_date = models.DateField(null=True, blank=True)
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    def update_streak(self):
+        """Update streak based on today's check-in."""
+        today = timezone.now().date()
+        
+        # First check-in ever
+        if not self.last_checkin_date:
+            self.current_streak = 1
+            self.longest_streak = 1
+            self.last_checkin_date = today
+            self.save()
+            return
+        
+        # Already logged today
+        if self.last_checkin_date == today:
+            return
+        
+        # Consecutive day
+        if self.last_checkin_date == today - timedelta(days=1):
+            self.current_streak += 1
+        # Streak broken
+        else:
+            self.current_streak = 1
+        
+        # Update longest
+        if self.current_streak > self.longest_streak:
+            self.longest_streak = self.current_streak
+        
+        self.last_checkin_date = today
+        self.save()
+    
+    def track_feature_use(self, feature_name):
+        """Increment usage counter for a feature."""
+        if feature_name not in self.features_used:
+            self.features_used[feature_name] = 0
+        self.features_used[feature_name] += 1
+        self.save()
+    
+    def get_favorite_features(self, top_n=3):
+        """Return most-used features."""
+        sorted_features = sorted(
+            self.features_used.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+        return sorted_features[:top_n]
+    
+    def __str__(self):
+        return f"{self.user.username} - {self.current_streak} day streak"
+    
+    class Meta:
+        verbose_name = 'User Statistics'
+        verbose_name_plural = 'User Statistics'
+
+
+class UserPreferences(models.Model):
+    """
+    User Preferences & Personalization Settings.
+    
+    Controls notification timing, feature visibility, and adaptive UI.
+    """
+    user = models.OneToOneField(
+        User, on_delete=models.CASCADE, related_name='preferences'
+    )
+    
+    # Notification preferences
+    morning_checkin_enabled = models.BooleanField(
+        default=True,
+        help_text="Send morning check-in prompt"
+    )
+    morning_checkin_time = models.TimeField(
+        default='09:00',
+        help_text="Preferred morning check-in time"
+    )
+    evening_checkin_enabled = models.BooleanField(
+        default=True,
+        help_text="Send evening reflection prompt"
+    )
+    evening_checkin_time = models.TimeField(
+        default='21:00',
+        help_text="Preferred evening reflection time"
+    )
+    post_study_prompt = models.BooleanField(
+        default=True,
+        help_text="Prompt mood check after study sessions"
+    )
+    
+    # Adaptive interface
+    hidden_features = models.JSONField(
+        default=list,
+        help_text="Features user has chosen to hide: ['study_tracking']"
+    )
+    favorite_resources = models.JSONField(
+        default=list,
+        help_text="Resource IDs user frequently accesses"
+    )
+    
+    # Theme preferences
+    THEME_CHOICES = [
+        ('auto', 'Auto (based on mood)'),
+        ('light', 'Light'),
+        ('dark', 'Dark'),
+        ('calming', 'Calming (Green/Blue)'),
+    ]
+    theme_preference = models.CharField(
+        max_length=10,
+        choices=THEME_CHOICES,
+        default='auto'
+    )
+    
+    # Crisis support acknowledgment
+    crisis_resources_shown = models.BooleanField(
+        default=False,
+        help_text="User has seen crisis resources"
+    )
+    crisis_resources_last_shown = models.DateTimeField(null=True, blank=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    def __str__(self):
+        return f"{self.user.username} - Preferences"
+    
+    class Meta:
+        verbose_name = 'User Preference'
+        verbose_name_plural = 'User Preferences'
+
+
+# ==================== ENHANCED MOOD TRACKING ====================
+
+class EnhancedMoodEntry(models.Model):
+    """
+    Enhanced Mood Entry with Context-Aware Features.
+    
+    Extends the base MoodEntry with:
+    - Time-of-day context (morning/evening)
+    - Mood intensity slider (1-10)
+    - Energy level tracking
+    - Daily wins/drains
+    - Voice note support
+    """
+    # Link to original MoodEntry (one-to-one relationship)
+    # In production, you'd merge this into MoodEntry directly
+    mood_entry = models.OneToOneField(
+        'MoodEntry',
+        on_delete=models.CASCADE,
+        related_name='enhancement',
+        null=True, blank=True
+    )
+    
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    
+    # Context-aware fields
+    TIME_OF_DAY_CHOICES = [
+        ('morning', 'Morning'),
+        ('afternoon', 'Afternoon'),
+        ('evening', 'Evening'),
+        ('night', 'Night'),
+    ]
+    time_of_day = models.CharField(
+        max_length=10,
+        choices=TIME_OF_DAY_CHOICES,
+        default='evening'
+    )
+    
+    # Intensity tracking
+    mood_intensity = models.IntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(10)],
+        default=5,
+        help_text="Mood intensity on 1-10 scale"
+    )
+    energy_level = models.IntegerField(
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+        default=50,
+        help_text="Energy level percentage (0-100)"
+    )
+    
+    # Daily reflection
+    day_rating = models.IntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(5)],
+        null=True, blank=True,
+        help_text="Overall day rating (1-5 stars)"
+    )
+    wins_today = models.TextField(
+        blank=True,
+        help_text="Today's wins, accomplishments, or positive moments"
+    )
+    energy_drains = models.JSONField(
+        default=list,
+        help_text="What drained energy: ['overthinking', 'social_anxiety']"
+    )
+    
+    # Academic worries
+    worries_today = models.JSONField(
+        default=list,
+        help_text="Specific worries: ['exam', 'assignment', 'social']"
+    )
+    
+    # Voice note support
+    voice_note_url = models.URLField(
+        blank=True,
+        help_text="URL to stored voice note (S3, Firebase, etc.)"
+    )
+    voice_note_duration = models.IntegerField(
+        null=True, blank=True,
+        help_text="Voice note duration in seconds"
+    )
+    voice_transcription = models.TextField(
+        blank=True,
+        help_text="Transcribed text from voice note"
+    )
+    
+    class Meta:
+        ordering = ['-timestamp']
+        verbose_name = 'Enhanced Mood Entry'
+        verbose_name_plural = 'Enhanced Mood Entries'
+    
+    def __str__(self):
+        return f"{self.user.username} - {self.time_of_day} check-in"
+
+
+# ==================== MICRO-COMMITMENTS ====================
+
+class MicroCommitment(models.Model):
+    """
+    Micro-Commitments for Behavioral Intervention.
+    
+    After high anxiety/stress, suggest tiny actionable steps.
+    Track completion for positive reinforcement.
+    """
+    COMMITMENT_TYPES = [
+        ('breathing', '3 Deep Breaths'),
+        ('water', 'Drink Water'),
+        ('walk', 'Step Outside (2 min)'),
+        ('friend', 'Text a Friend'),
+        ('stretch', 'Quick Stretch'),
+        ('gratitude', 'Write One Gratitude'),
+    ]
+    
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    mood_entry = models.ForeignKey(
+        'MoodEntry',
+        on_delete=models.CASCADE,
+        related_name='commitments'
+    )
+    
+    commitment_type = models.CharField(
+        max_length=20,
+        choices=COMMITMENT_TYPES
+    )
+    committed_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    
+    # Completion tracking
+    reminder_sent = models.BooleanField(default=False)
+    reminder_sent_at = models.DateTimeField(null=True, blank=True)
+    
+    def mark_complete(self):
+        """Mark commitment as completed."""
+        self.completed_at = timezone.now()
+        self.save()
+        
+        # Trigger positive reinforcement
+        # (You'd send a notification or show celebration UI)
+        return True
+    
+    @property
+    def is_completed(self):
+        return self.completed_at is not None
+    
+    @property
+    def time_to_complete(self):
+        """Time taken to complete in minutes."""
+        if not self.completed_at:
+            return None
+        delta = self.completed_at - self.committed_at
+        return int(delta.total_seconds() / 60)
+    
+    def __str__(self):
+        status = "✓" if self.is_completed else "○"
+        return f"{status} {self.user.username} - {self.get_commitment_type_display()}"
+    
+    class Meta:
+        ordering = ['-committed_at']
+        verbose_name = 'Micro Commitment'
+        verbose_name_plural = 'Micro Commitments'
+
+
+# ==================== PATTERN DETECTION ====================
+
+class DetectedPattern(models.Model):
+    """
+    ML-Detected Behavioral Patterns.
+    
+    Stores patterns like "anxiety spikes on Mondays" for proactive support.
+    """
+    PATTERN_TYPES = [
+        ('weekly_spike', 'Weekly Anxiety Spike'),
+        ('pre_exam_stress', 'Pre-Exam Stress Pattern'),
+        ('sleep_mood_correlation', 'Sleep-Mood Correlation'),
+        ('study_burnout', 'Study Session Burnout'),
+        ('social_anxiety_timing', 'Social Anxiety Timing'),
+    ]
+    
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    pattern_type = models.CharField(max_length=30, choices=PATTERN_TYPES)
+    
+    # Pattern details
+    detected_at = models.DateTimeField(auto_now_add=True)
+    confidence = models.FloatField(
+        validators=[MinValueValidator(0.0), MaxValueValidator(1.0)],
+        help_text="Confidence score (0-1) based on data points"
+    )
+    
+    # Pattern metadata
+    metadata = models.JSONField(
+        default=dict,
+        help_text="Pattern details: {'day': 'Monday', 'time': '14:00', 'trigger': 'class'}"
+    )
+    
+    # User interaction
+    acknowledged = models.BooleanField(default=False)
+    acknowledged_at = models.DateTimeField(null=True, blank=True)
+    helpful = models.BooleanField(
+        null=True,
+        help_text="User feedback: was this insight helpful?"
+    )
+    
+    # Active/dismissed
+    is_active = models.BooleanField(
+        default=True,
+        help_text="False if pattern no longer valid or user dismissed"
+    )
+    
+    def get_insight_message(self):
+        """Generate human-readable insight."""
+        if self.pattern_type == 'weekly_spike':
+            day = self.metadata.get('day', 'a certain day')
+            return f"Your anxiety tends to spike on {day}s. Plan self-care ahead."
+        
+        elif self.pattern_type == 'sleep_mood_correlation':
+            threshold = self.metadata.get('sleep_hours', 7)
+            improvement = self.metadata.get('mood_improvement', '2x')
+            return f"When you sleep {threshold}+ hours, your mood is {improvement} better."
+        
+        elif self.pattern_type == 'pre_exam_stress':
+            days_before = self.metadata.get('days_before', 2)
+            return f"You typically feel stressed {days_before} days before exams. Prepare coping strategies."
+        
+        return "Pattern detected in your wellness data."
+    
+    def __str__(self):
+        return f"{self.user.username} - {self.get_pattern_type_display()}"
+    
+    class Meta:
+        ordering = ['-detected_at']
+        verbose_name = 'Detected Pattern'
+        verbose_name_plural = 'Detected Patterns'
+        indexes = [
+            models.Index(fields=['user', 'is_active']),
+        ]
+
+
+# ==================== PERSONAL INSIGHTS ====================
+
+class PersonalInsight(models.Model):
+    """
+    Personalized Insights Generated Weekly.
+    
+    Examples:
+    - "You studied 12 hours this week vs 8 hours last week (+50%)"
+    - "Your best sleep nights were Tuesday-Thursday (avg 8.2h)"
+    - "Breathing exercises correlated with 1.5x better mood"
+    """
+    INSIGHT_TYPES = [
+        ('trend', 'Trend Analysis'),
+        ('correlation', 'Correlation Discovery'),
+        ('achievement', 'Achievement Highlight'),
+        ('recommendation', 'Personalized Recommendation'),
+        ('warning', 'Early Warning'),
+    ]
+    
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    insight_type = models.CharField(max_length=20, choices=INSIGHT_TYPES)
+    
+    # Content
+    title = models.CharField(
+        max_length=200,
+        help_text="Insight headline: 'Your Best Week Yet!'"
+    )
+    message = models.TextField(
+        help_text="Full insight message with actionable advice"
+    )
+    
+    # Data backing
+    data_points = models.JSONField(
+        default=dict,
+        help_text="Supporting data: {'sleep_avg': 7.2, 'mood_avg': 0.6}"
+    )
+    
+    # Metadata
+    generated_at = models.DateTimeField(auto_now_add=True)
+    for_week_starting = models.DateField(
+        help_text="Week this insight covers"
+    )
+    
+    # User interaction
+    viewed = models.BooleanField(default=False)
+    viewed_at = models.DateTimeField(null=True, blank=True)
+    helpful_rating = models.IntegerField(
+        null=True, blank=True,
+        validators=[MinValueValidator(1), MaxValueValidator(5)],
+        help_text="User's helpfulness rating (1-5)"
+    )
+    
+    # Priority (for sorting)
+    priority = models.IntegerField(
+        default=3,
+        help_text="1=highest, 5=lowest"
+    )
+    
+    class Meta:
+        ordering = ['priority', '-generated_at']
+        verbose_name = 'Personal Insight'
+        verbose_name_plural = 'Personal Insights'
+    
+    def __str__(self):
+        return f"{self.user.username} - {self.title}"
+
+
+# ==================== CRISIS SUPPORT ====================
+
+class CrisisCheckpoint(models.Model):
+    """
+    Crisis Detection & Resource Provision Log.
+    
+    Tracks when crisis indicators are detected and resources shown.
+    Important for safety and liability.
+    """
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    detected_at = models.DateTimeField(auto_now_add=True)
+    
+    # Detection criteria
+    SEVERITY_LEVELS = [
+        ('low', 'Low'),
+        ('medium', 'Medium'),
+        ('high', 'High'),
+        ('critical', 'Critical'),
+    ]
+    severity = models.CharField(max_length=10, choices=SEVERITY_LEVELS)
+    
+    # Indicators
+    indicators = models.JSONField(
+        default=list,
+        help_text="List of indicators: ['3_high_anxiety_today', 'sleep_<4h_3days']"
+    )
+    
+    # Resources shown
+    resources_shown = models.JSONField(
+        default=list,
+        help_text="Resources presented: ['campus_counseling', 'crisis_text_line']"
+    )
+    
+    # User response
+    resources_viewed = models.BooleanField(default=False)
+    resources_viewed_at = models.DateTimeField(null=True, blank=True)
+    user_dismissed = models.BooleanField(default=False)
+    user_contacted_resource = models.BooleanField(
+        null=True,
+        help_text="Self-reported: did user reach out?"
+    )
+    
+    # Follow-up
+    follow_up_scheduled = models.BooleanField(default=False)
+    follow_up_at = models.DateTimeField(null=True, blank=True)
+    
+    class Meta:
+        ordering = ['-detected_at']
+        verbose_name = 'Crisis Checkpoint'
+        verbose_name_plural = 'Crisis Checkpoints'
+    
+    def __str__(self):
+        return f"{self.user.username} - {self.severity.upper()} at {self.detected_at}"
+
+
+# ==================== CARE PACKAGES ====================
+
+class CarePackage(models.Model):
+    """
+    Pre-Exam / High-Stress Period Care Packages.
+    
+    Curated collection of resources activated before stressful events.
+    """
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    academic_event = models.ForeignKey(
+        'AcademicEvent',
+        on_delete=models.CASCADE,
+        related_name='care_packages'
+    )
+    
+    # Activation
+    activated_at = models.DateTimeField(auto_now_add=True)
+    event_starts_at = models.DateField(
+        help_text="When the stressful event begins"
+    )
+    
+    # Package contents
+    resources_included = models.JSONField(
+        default=list,
+        help_text="List of WellnessResource IDs included"
+    )
+    tips = models.JSONField(
+        default=list,
+        help_text="Text tips: ['Get 8h sleep', 'Eat breakfast', 'Arrive early']"
+    )
+    
+    # Adjustments made
+    sleep_goal_adjusted = models.BooleanField(default=False)
+    new_sleep_goal = models.FloatField(null=True, blank=True)
+    
+    # User interaction
+    viewed = models.BooleanField(default=False)
+    viewed_at = models.DateTimeField(null=True, blank=True)
+    helpful = models.BooleanField(null=True)
+    
+    class Meta:
+        ordering = ['-activated_at']
+        verbose_name = 'Care Package'
+        verbose_name_plural = 'Care Packages'
+    
+    def __str__(self):
+        return f"Care Package for {self.user.username} - {self.academic_event.event_name}"
+
+
+# ==================== COMMUNITY STATS (ANONYMOUS) ====================
+
+class CommunitySnapshot(models.Model):
+    """
+    Daily Anonymous Community Statistics.
+    
+    Used for "You're not alone" social proof without identifying individuals.
+    Aggregated daily by a background task.
+    """
+    snapshot_date = models.DateField(unique=True)
+    
+    # Activity stats
+    active_users_count = models.IntegerField(default=0)
+    total_mood_entries = models.IntegerField(default=0)
+    
+    # Aggregate wellness
+    avg_health_score = models.FloatField(null=True)
+    avg_anxiety_level = models.FloatField(
+        null=True,
+        help_text="Average anxiety on 1-3 scale (1=Low, 2=Moderate, 3=High)"
+    )
+    avg_stress_level = models.FloatField(null=True)
+    avg_sleep_hours = models.FloatField(null=True)
+    
+    # Popular activities
+    most_used_resource_id = models.IntegerField(null=True)
+    breathing_exercises_count = models.IntegerField(default=0)
+    
+    # Context
+    active_events = models.JSONField(
+        default=list,
+        help_text="Academic events active today: ['Finals Week', 'Midterms']"
+    )
+    
+    generated_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['-snapshot_date']
+        verbose_name = 'Community Snapshot'
+        verbose_name_plural = 'Community Snapshots'
+    
+    def __str__(self):
+        return f"Community Stats - {self.snapshot_date}"
+
+
+# ==================== DELETED ITEMS (SOFT DELETE) ====================
+
+class DeletedMoodEntry(models.Model):
+    """
+    Soft-deleted mood entries for 30-day undo window.
+    
+    Allows users to undo accidental deletions.
+    """
+    original_id = models.IntegerField()
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    
+    # Original data (JSON snapshot)
+    original_data = models.JSONField()
+    
+    # Deletion tracking
+    deleted_at = models.DateTimeField(auto_now_add=True)
+    deleted_by_user = models.BooleanField(
+        default=True,
+        help_text="False if auto-deleted by admin"
+    )
+    
+    # Restoration tracking
+    restored = models.BooleanField(default=False)
+    restored_at = models.DateTimeField(null=True, blank=True)
+    
+    # Auto-cleanup after 30 days
+    permanent_delete_at = models.DateTimeField()
+    
+    def save(self, *args, **kwargs):
+        if not self.permanent_delete_at:
+            self.permanent_delete_at = timezone.now() + timedelta(days=30)
+        super().save(*args, **kwargs)
+    
+    def restore(self):
+        """Restore the deleted entry."""
+        # Recreate MoodEntry from original_data
+        # Implementation depends on your restoration logic
+        self.restored = True
+        self.restored_at = timezone.now()
+        self.save()
+    
+    class Meta:
+        ordering = ['-deleted_at']
+        verbose_name = 'Deleted Mood Entry'
+        verbose_name_plural = 'Deleted Mood Entries'
+    
+    def __str__(self):
+        return f"Deleted entry #{self.original_id} - {self.user.username}"
+
+

@@ -1,0 +1,860 @@
+from django.contrib import admin
+from .models import MoodEntry, SleepLog, StudySession, AcademicEvent, WellnessResource
+from .models import (
+    UserStats, UserPreferences, EnhancedMoodEntry,
+    MicroCommitment, DetectedPattern, PersonalInsight,
+    CrisisCheckpoint, CarePackage, CommunitySnapshot,
+    DeletedMoodEntry
+)
+from django.utils.html import format_html
+
+
+@admin.register(AcademicEvent)
+class AcademicEventAdmin(admin.ModelAdmin):
+    """Admin interface for Academic Events."""
+    list_display = ['event_name', 'start_date', 'end_date', 'is_currently_active', 'created_at']
+    list_filter = ['start_date', 'end_date']
+    search_fields = ['event_name', 'description']
+    ordering = ['-start_date']
+    date_hierarchy = 'start_date'
+    
+    fieldsets = (
+        ('Event Details', {
+            'fields': ('event_name', 'description')
+        }),
+        ('Date Range', {
+            'fields': ('start_date', 'end_date')
+        }),
+    )
+    
+    def is_currently_active(self, obj):
+        return obj.is_active_on()
+    is_currently_active.boolean = True
+    is_currently_active.short_description = 'Active Now'
+
+
+@admin.register(MoodEntry)
+class MoodEntryAdmin(admin.ModelAdmin):
+    """Admin interface for Mood Entries."""
+    list_display = [
+        'user',
+        'timestamp',
+        'sentiment_score',
+        'depression_level',
+        'anxiety_level',
+        'stress_level'
+    ]
+    list_filter = [
+        'depression_level',
+        'anxiety_level',
+        'stress_level',
+        'timestamp'
+    ]
+    search_fields = ['user__username', 'note']
+    ordering = ['-timestamp']
+    date_hierarchy = 'timestamp'
+    
+    readonly_fields = [
+        'sentiment_score',
+        'depression_level',
+        'anxiety_level',
+        'stress_level',
+        'timestamp'
+    ]
+    
+    fieldsets = (
+    ('User & Time', {
+        'fields': ('user', 'timestamp')
+    }),
+    ('Student Input', {
+        'fields': ('user_selected_mood', 'note'),
+        'description': 'user_selected_mood: SAD, ANX, STR, HAP, or NEU'
+    }),
+    ('AI Analysis (Auto-Calculated)', {
+        'fields': (
+            'sentiment_score',
+            'depression_level',
+            'anxiety_level',
+            'stress_level'
+        ),
+        'description': 'These fields are automatically calculated by the Data Fusion Engine'
+    }),
+)
+    
+    def has_add_permission(self, request):
+        return True  # Entries should be created via API
+
+
+@admin.register(SleepLog)
+class SleepLogAdmin(admin.ModelAdmin):
+    """Admin interface for Sleep Logs."""
+    list_display = ['user', 'date', 'hours_slept', 'created_at' , 'quality_tag', 'interruption_count']
+    list_filter = ['date', 'created_at']
+    search_fields = ['user__username']
+    ordering = ['-date']
+    date_hierarchy = 'date'
+    
+    fieldsets = (
+        ('User & Date', {
+            'fields': ('user', 'date')
+        }),
+        ('Sleep Interval', {
+            'fields': ('sleep_from', 'sleep_to', 'interruption_count'),
+            'description': 'Enter the time you went to bed and woke up'
+        }),
+        ('Auto-Calculated Results', {
+            'fields': ('hours_slept', 'quality_tag'),
+            'description': 'These fields are automatically calculated based on sleep interval and interruptions'
+        }),
+    )
+    
+    # Make calculated fields read-only (grayed out)
+    readonly_fields = ['hours_slept', 'quality_tag']
+    def readable_duration(self, obj):
+        return obj.get_duration_display()
+    readable_duration.short_description = 'Duration'
+
+
+@admin.register(StudySession)
+class StudySessionAdmin(admin.ModelAdmin):
+    """Admin interface for Study Sessions."""
+    list_display = [
+        'user',
+        'subject',
+        'start_time',
+        'duration_minutes',
+        'created_at'
+    ]
+    list_filter = ['subject', 'start_time']
+    search_fields = ['user__username', 'subject']
+    ordering = ['-start_time']
+    date_hierarchy = 'start_time'
+    
+    readonly_fields = ['duration_minutes']
+    
+    fieldsets = (
+        ('User & Subject', {
+            'fields': ('user', 'subject')
+        }),
+        ('Time Range', {
+            'fields': ('start_time', 'end_time', 'duration_minutes'),
+            'description': 'duration_minutes is auto-calculated'
+        }),
+    )
+
+
+@admin.register(WellnessResource)
+class WellnessResourceAdmin(admin.ModelAdmin):
+    """
+    Admin interface for the Wellness Resource catalogue.
+
+    This is the main content-management screen for the carousel.
+    Admins add/edit cards here; the API automatically ranks and returns
+    them based on each student's current wellness state.
+
+    Tag guide (comma-separate multiple tags in one field):
+      Stress/anxiety cards  →  tags: "breathing,stress"  or  "meditation,anxiety"
+      Sleep hygiene cards   →  tags: "sleep,recovery"
+      Focus/study cards     →  tags: "focus,study"
+      Mood/journal cards    →  tags: "journal,mood"
+    """
+    list_display  = ['title', 'category', 'action', 'priority', 'is_active', 'updated_at']
+    list_filter   = ['category', 'is_active']
+    search_fields = ['title', 'tags', 'action']
+    ordering      = ['priority', 'category']
+    list_editable = ['priority', 'is_active']   # quick edits without opening each row
+
+    fieldsets = (
+        ('Card Content', {
+            'fields': ('title', 'category', 'image_url', 'content_link'),
+        }),
+        ('Frontend Rendering', {
+            'fields': ('color', 'action'),
+            'description': (
+                'color: hex string, e.g. #4A3728. '
+                'action: token the app routes on, e.g. breathe, journal, sleep_tips, meditate, focus.'
+            ),
+        }),
+        ('Recommendation Engine', {
+            'fields': ('tags', 'priority', 'is_active'),
+            'description': (
+                'tags: comma-separated, e.g. "breathing,stress". '
+                'priority: lower number = shown first. '
+                'is_active: uncheck to hide from all API responses immediately.'
+            ),
+        }),
+    )
+
+@admin.register(UserStats)
+class UserStatsAdmin(admin.ModelAdmin):
+    """Track user engagement, streaks, and usage patterns."""
+    
+    list_display = [
+        'user',
+        'current_streak_display',
+        'longest_streak',
+        'total_checkins',
+        'best_health_score',
+        'last_checkin_date',
+    ]
+    list_filter = ['last_checkin_date', 'current_streak']
+    search_fields = ['user__username', 'user__email']
+    readonly_fields = [
+        'current_streak',
+        'longest_streak',
+        'last_checkin_date',
+        'total_checkins',
+        'features_used_display',
+        'created_at',
+        'updated_at',
+    ]
+    
+    fieldsets = (
+        ('User', {
+            'fields': ('user',)
+        }),
+        ('Streaks & Engagement', {
+            'fields': (
+                'current_streak',
+                'longest_streak',
+                'last_checkin_date',
+                'total_checkins',
+            )
+        }),
+        ('Feature Usage', {
+            'fields': ('features_used_display',),
+            'description': 'Which features this user engages with most'
+        }),
+        ('Personal Bests', {
+            'fields': (
+                'best_health_score',
+                'best_health_score_date',
+            )
+        }),
+        ('Timestamps', {
+            'fields': ('created_at', 'updated_at'),
+            'classes': ('collapse',)
+        }),
+    )
+    
+    def current_streak_display(self, obj):
+        """Display streak with fire emoji."""
+        if obj.current_streak >= 7:
+            return format_html('🔥 <strong>{} days</strong>', obj.current_streak)
+        return f"{obj.current_streak} days"
+    current_streak_display.short_description = 'Current Streak'
+    
+    def features_used_display(self, obj):
+        """Format features_used JSON nicely."""
+        if not obj.features_used:
+            return "No feature usage yet"
+        
+        items = []
+        for feature, count in sorted(obj.features_used.items(), key=lambda x: x[1], reverse=True):
+            items.append(f"{feature}: {count}")
+        return ", ".join(items[:5])  # Top 5
+    features_used_display.short_description = 'Feature Usage'
+
+
+# ==================== USER PREFERENCES ====================
+
+@admin.register(UserPreferences)
+class UserPreferencesAdmin(admin.ModelAdmin):
+    """Manage user notification settings and personalization."""
+    
+    list_display = [
+        'user',
+        'morning_checkin_enabled',
+        'evening_checkin_enabled',
+        'theme_preference',
+        'crisis_resources_shown',
+    ]
+    list_filter = [
+        'morning_checkin_enabled',
+        'evening_checkin_enabled',
+        'theme_preference',
+        'crisis_resources_shown',
+    ]
+    search_fields = ['user__username']
+    
+    fieldsets = (
+        ('User', {
+            'fields': ('user',)
+        }),
+        ('Notification Preferences', {
+            'fields': (
+                'morning_checkin_enabled',
+                'morning_checkin_time',
+                'evening_checkin_enabled',
+                'evening_checkin_time',
+                'post_study_prompt',
+            )
+        }),
+        ('Interface Customization', {
+            'fields': (
+                'theme_preference',
+                'hidden_features',
+                'favorite_resources',
+            )
+        }),
+        ('Crisis Support', {
+            'fields': (
+                'crisis_resources_shown',
+                'crisis_resources_last_shown',
+            )
+        }),
+    )
+
+
+# ==================== ENHANCED MOOD ENTRY ====================
+
+@admin.register(EnhancedMoodEntry)
+class EnhancedMoodEntryAdmin(admin.ModelAdmin):
+    """Extended mood data with context and voice notes."""
+    
+    list_display = [
+        'user',
+        'timestamp',
+        'time_of_day',
+        'mood_intensity',
+        'energy_level',
+        'has_voice_note',
+        'day_rating',
+    ]
+    list_filter = ['time_of_day', 'day_rating', 'timestamp']
+    search_fields = ['user__username', 'wins_today', 'voice_transcription']
+    readonly_fields = ['timestamp', 'voice_note_duration']
+    
+    fieldsets = (
+        ('Basic Info', {
+            'fields': ('user', 'mood_entry', 'timestamp', 'time_of_day')
+        }),
+        ('Intensity Tracking', {
+            'fields': ('mood_intensity', 'energy_level', 'day_rating')
+        }),
+        ('Daily Reflection', {
+            'fields': ('wins_today', 'energy_drains', 'worries_today')
+        }),
+        ('Voice Note', {
+            'fields': (
+                'voice_note_url',
+                'voice_note_duration',
+                'voice_transcription',
+            ),
+            'classes': ('collapse',)
+        }),
+    )
+    
+    def has_voice_note(self, obj):
+        return bool(obj.voice_note_url)
+    has_voice_note.boolean = True
+    has_voice_note.short_description = 'Voice Note'
+
+
+# ==================== MICRO COMMITMENTS ====================
+
+@admin.register(MicroCommitment)
+class MicroCommitmentAdmin(admin.ModelAdmin):
+    """Track tiny behavioral interventions."""
+    
+    list_display = [
+        'user',
+        'commitment_type_display',
+        'committed_at',
+        'completion_status',
+        'time_to_complete_display',
+    ]
+    list_filter = [
+        'commitment_type',
+        'completed_at',
+        'committed_at',
+    ]
+    search_fields = ['user__username']
+    readonly_fields = ['committed_at', 'completed_at', 'reminder_sent_at']
+    
+    fieldsets = (
+        ('Commitment Details', {
+            'fields': (
+                'user',
+                'mood_entry',
+                'commitment_type',
+                'committed_at',
+            )
+        }),
+        ('Completion', {
+            'fields': (
+                'completed_at',
+            )
+        }),
+        ('Reminders', {
+            'fields': (
+                'reminder_sent',
+                'reminder_sent_at',
+            ),
+            'classes': ('collapse',)
+        }),
+    )
+    
+    def commitment_type_display(self, obj):
+        """Show commitment with emoji."""
+        icons = {
+            'breathing': '🫁',
+            'water': '💧',
+            'walk': '🚶',
+            'friend': '👋',
+            'stretch': '🤸',
+            'gratitude': '🙏',
+        }
+        icon = icons.get(obj.commitment_type, '✓')
+        return f"{icon} {obj.get_commitment_type_display()}"
+    commitment_type_display.short_description = 'Commitment'
+    
+    def completion_status(self, obj):
+        """Visual completion status."""
+        if obj.is_completed:
+            return format_html('✅ <strong>Completed</strong>')
+        return format_html('⏳ Pending')
+    completion_status.short_description = 'Status'
+    
+    def time_to_complete_display(self, obj):
+        """Show time taken."""
+        if obj.time_to_complete:
+            return f"{obj.time_to_complete} minutes"
+        return "-"
+    time_to_complete_display.short_description = 'Time Taken'
+
+
+# ==================== DETECTED PATTERNS ====================
+
+@admin.register(DetectedPattern)
+class DetectedPatternAdmin(admin.ModelAdmin):
+    """ML-detected behavioral patterns."""
+    
+    list_display = [
+        'user',
+        'pattern_type',
+        'confidence_display',
+        'detected_at',
+        'acknowledged',
+        'helpful_display',
+        'is_active',
+    ]
+    list_filter = [
+        'pattern_type',
+        'is_active',
+        'acknowledged',
+        'helpful',
+        'detected_at',
+    ]
+    search_fields = ['user__username', 'metadata']
+    readonly_fields = ['detected_at', 'acknowledged_at']
+    
+    fieldsets = (
+        ('Pattern Details', {
+            'fields': (
+                'user',
+                'pattern_type',
+                'confidence',
+                'detected_at',
+            )
+        }),
+        ('Pattern Data', {
+            'fields': ('metadata',),
+            'description': 'JSON data describing the pattern (day, time, triggers, etc.)'
+        }),
+        ('User Interaction', {
+            'fields': (
+                'acknowledged',
+                'acknowledged_at',
+                'helpful',
+                'is_active',
+            )
+        }),
+    )
+    
+    def confidence_display(self, obj):
+        """Show confidence as percentage."""
+        percentage = int(obj.confidence * 100)
+        if percentage >= 80:
+            color = 'green'
+        elif percentage >= 60:
+            color = 'orange'
+        else:
+            color = 'red'
+        return format_html(
+            '<span style="color: {};">{:.0%}</span>',
+            color, obj.confidence
+        )
+    confidence_display.short_description = 'Confidence'
+    
+    def helpful_display(self, obj):
+        """Visual helpful indicator."""
+        if obj.helpful is None:
+            return "-"
+        return "👍" if obj.helpful else "👎"
+    helpful_display.short_description = 'Helpful?'
+
+
+# ==================== PERSONAL INSIGHTS ====================
+
+@admin.register(PersonalInsight)
+class PersonalInsightAdmin(admin.ModelAdmin):
+    """Weekly personalized insights."""
+    
+    list_display = [
+        'user',
+        'title',
+        'insight_type',
+        'priority_display',
+        'generated_at',
+        'viewed',
+        'helpful_rating',
+    ]
+    list_filter = [
+        'insight_type',
+        'priority',
+        'viewed',
+        'helpful_rating',
+        'generated_at',
+    ]
+    search_fields = ['user__username', 'title', 'message']
+    readonly_fields = ['generated_at', 'viewed_at']
+    
+    fieldsets = (
+        ('Insight Details', {
+            'fields': (
+                'user',
+                'insight_type',
+                'title',
+                'message',
+                'priority',
+            )
+        }),
+        ('Supporting Data', {
+            'fields': ('data_points', 'for_week_starting'),
+            'description': 'Data that backs up this insight'
+        }),
+        ('User Engagement', {
+            'fields': (
+                'viewed',
+                'viewed_at',
+                'helpful_rating',
+            )
+        }),
+        ('Metadata', {
+            'fields': ('generated_at',),
+            'classes': ('collapse',)
+        }),
+    )
+    
+    def priority_display(self, obj):
+        """Visual priority indicator."""
+        stars = '⭐' * (6 - obj.priority)  # 1=highest gets 5 stars
+        return stars
+    priority_display.short_description = 'Priority'
+
+
+# ==================== CRISIS CHECKPOINTS ====================
+
+@admin.register(CrisisCheckpoint)
+class CrisisCheckpointAdmin(admin.ModelAdmin):
+    """⚠️ Critical: Crisis detection logs for safety."""
+    
+    list_display = [
+        'user',
+        'severity_display',
+        'detected_at',
+        'resources_viewed',
+        'user_contacted_resource',
+    ]
+    list_filter = [
+        'severity',
+        'resources_viewed',
+        'user_contacted_resource',
+        'detected_at',
+    ]
+    search_fields = ['user__username', 'indicators']
+    readonly_fields = [
+        'detected_at',
+        'resources_viewed_at',
+        'indicators_display',
+        'resources_shown_display',
+    ]
+    
+    fieldsets = (
+        ('⚠️ Crisis Details', {
+            'fields': (
+                'user',
+                'severity',
+                'detected_at',
+            ),
+            'classes': ('wide',)
+        }),
+        ('Detection Indicators', {
+            'fields': ('indicators_display',),
+            'description': '⚠️ What triggered the crisis detection'
+        }),
+        ('Resources Provided', {
+            'fields': ('resources_shown_display',)
+        }),
+        ('User Response', {
+            'fields': (
+                'resources_viewed',
+                'resources_viewed_at',
+                'user_dismissed',
+                'user_contacted_resource',
+            )
+        }),
+        ('Follow-Up', {
+            'fields': (
+                'follow_up_scheduled',
+                'follow_up_at',
+            )
+        }),
+    )
+    
+    def severity_display(self, obj):
+        """Color-coded severity."""
+        colors = {
+            'low': 'blue',
+            'medium': 'orange',
+            'high': 'red',
+            'critical': 'darkred',
+        }
+        return format_html(
+            '<strong style="color: {};">{}</strong>',
+            colors.get(obj.severity, 'black'),
+            obj.severity.upper()
+        )
+    severity_display.short_description = 'Severity'
+    
+    def indicators_display(self, obj):
+        """Format indicators nicely."""
+        if not obj.indicators:
+            return "No indicators"
+        return ", ".join(obj.indicators)
+    indicators_display.short_description = 'Indicators'
+    
+    def resources_shown_display(self, obj):
+        """Format resources list."""
+        if not obj.resources_shown:
+            return "No resources shown"
+        
+        items = []
+        for resource in obj.resources_shown:
+            if isinstance(resource, dict):
+                items.append(resource.get('name', 'Unknown'))
+            else:
+                items.append(str(resource))
+        return ", ".join(items)
+    resources_shown_display.short_description = 'Resources Shown'
+
+
+# ==================== CARE PACKAGES ====================
+
+@admin.register(CarePackage)
+class CarePackageAdmin(admin.ModelAdmin):
+    """Pre-exam support bundles."""
+    
+    list_display = [
+        'user',
+        'academic_event',
+        'event_starts_at',
+        'activated_at',
+        'viewed',
+        'helpful_display',
+    ]
+    list_filter = [
+        'viewed',
+        'helpful',
+        'activated_at',
+        'event_starts_at',
+    ]
+    search_fields = ['user__username', 'academic_event__event_name']
+    readonly_fields = ['activated_at', 'viewed_at']
+    
+    fieldsets = (
+        ('Package Info', {
+            'fields': (
+                'user',
+                'academic_event',
+                'event_starts_at',
+                'activated_at',
+            )
+        }),
+        ('Package Contents', {
+            'fields': (
+                'resources_included',
+                'tips',
+            )
+        }),
+        ('Adjustments Made', {
+            'fields': (
+                'sleep_goal_adjusted',
+                'new_sleep_goal',
+            )
+        }),
+        ('User Engagement', {
+            'fields': (
+                'viewed',
+                'viewed_at',
+                'helpful',
+            )
+        }),
+    )
+    
+    def helpful_display(self, obj):
+        """Visual helpful indicator."""
+        if obj.helpful is None:
+            return "-"
+        return "👍" if obj.helpful else "👎"
+    helpful_display.short_description = 'Helpful?'
+
+
+# ==================== COMMUNITY SNAPSHOTS ====================
+
+@admin.register(CommunitySnapshot)
+class CommunitySnapshotAdmin(admin.ModelAdmin):
+    """Daily anonymous community statistics."""
+    
+    list_display = [
+        'snapshot_date',
+        'active_users_count',
+        'total_mood_entries',
+        'avg_health_score',
+        'avg_anxiety_level_display',
+        'breathing_exercises_count',
+    ]
+    list_filter = ['snapshot_date', 'generated_at']
+    readonly_fields = ['generated_at']
+    date_hierarchy = 'snapshot_date'
+    
+    fieldsets = (
+        ('Snapshot Info', {
+            'fields': ('snapshot_date', 'generated_at')
+        }),
+        ('Activity Stats', {
+            'fields': (
+                'active_users_count',
+                'total_mood_entries',
+                'breathing_exercises_count',
+            )
+        }),
+        ('Aggregate Wellness', {
+            'fields': (
+                'avg_health_score',
+                'avg_anxiety_level',
+                'avg_stress_level',
+                'avg_sleep_hours',
+            )
+        }),
+        ('Context', {
+            'fields': (
+                'active_events',
+                'most_used_resource_id',
+            )
+        }),
+    )
+    
+    def avg_anxiety_level_display(self, obj):
+        """Visual anxiety level."""
+        if not obj.avg_anxiety_level:
+            return "-"
+        
+        level = obj.avg_anxiety_level
+        if level < 1.5:
+            color = 'green'
+            emoji = '😌'
+        elif level < 2.5:
+            color = 'orange'
+            emoji = '😐'
+        else:
+            color = 'red'
+            emoji = '😰'
+        
+        return format_html(
+            '{} <span style="color: {};">{:.2f}</span>',
+            emoji, color, level
+        )
+    avg_anxiety_level_display.short_description = 'Avg Anxiety'
+
+
+# ==================== DELETED MOOD ENTRIES ====================
+
+@admin.register(DeletedMoodEntry)
+class DeletedMoodEntryAdmin(admin.ModelAdmin):
+    """Soft-deleted entries with 30-day undo window."""
+    
+    list_display = [
+        'original_id',
+        'user',
+        'deleted_at',
+        'deleted_by_user',
+        'restored',
+        'days_until_permanent',
+    ]
+    list_filter = [
+        'deleted_by_user',
+        'restored',
+        'deleted_at',
+    ]
+    search_fields = ['user__username', 'original_id']
+    readonly_fields = [
+        'original_id',
+        'original_data',
+        'deleted_at',
+        'restored_at',
+        'permanent_delete_at',
+    ]
+    
+    fieldsets = (
+        ('Entry Info', {
+            'fields': (
+                'original_id',
+                'user',
+            )
+        }),
+        ('Original Data', {
+            'fields': ('original_data',),
+            'description': 'JSON snapshot of the deleted entry'
+        }),
+        ('Deletion Info', {
+            'fields': (
+                'deleted_at',
+                'deleted_by_user',
+                'permanent_delete_at',
+            )
+        }),
+        ('Restoration', {
+            'fields': (
+                'restored',
+                'restored_at',
+            )
+        }),
+    )
+    
+    def days_until_permanent(self, obj):
+        """Show days remaining before permanent deletion."""
+        if obj.restored:
+            return "Restored ✅"
+        
+        from django.utils import timezone
+        days_left = (obj.permanent_delete_at - timezone.now()).days
+        
+        if days_left <= 0:
+            return format_html('<span style="color: red;">Expired</span>')
+        elif days_left <= 7:
+            return format_html(
+                '<span style="color: orange;">{} days left</span>',
+                days_left
+            )
+        else:
+            return f"{days_left} days left"
+    days_until_permanent.short_description = 'Time Remaining'
+
+
+
+# ── Site branding ────────────────────────────────────────────────────────────
+admin.site.site_header = "Student Wellness Hub Administration"
+admin.site.site_title = "Wellness Hub Admin"
+admin.site.index_title = "Wellness Management Dashboard"

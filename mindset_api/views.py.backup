@@ -1,0 +1,1634 @@
+from rest_framework import viewsets, generics, permissions, status
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework_simplejwt.tokens import RefreshToken
+from django.contrib.auth import authenticate
+from django.contrib.auth.models import User
+from django.utils import timezone
+from django.db.models import Avg, Sum, Count
+from datetime import timedelta, datetime
+from .models import MoodEntry, SleepLog, StudySession, AcademicEvent, WellnessResource
+from .serializers import (
+    UserRegistrationSerializer,
+    MoodEntrySerializer,
+    SleepLogSerializer,
+    StudySessionSerializer
+)
+from rest_framework.decorators import action
+from collections import Counter
+from .models import (
+    MoodEntry, UserStats, UserPreferences, EnhancedMoodEntry,
+    MicroCommitment, DetectedPattern, PersonalInsight,
+    CrisisCheckpoint, CarePackage, CommunitySnapshot,
+    AcademicEvent, WellnessResource
+)
+
+
+# ==================== AUTHENTICATION VIEWS ====================
+
+class RegisterView(generics.CreateAPIView):
+    """
+    User Registration for Student Wellness Hub.
+    POST /api/register/
+    """
+    serializer_class = UserRegistrationSerializer
+    permission_classes = [permissions.AllowAny]
+
+
+class LoginView(APIView):
+    """
+    JWT Token Authentication.
+    POST /api/token/
+    """
+    permission_classes = [permissions.AllowAny]
+    
+    def post(self, request):
+        username = request.data.get('username')
+        password = request.data.get('password')
+        
+        user = authenticate(username=username, password=password)
+        
+        if user:
+            refresh = RefreshToken.for_user(user)
+            return Response({
+                'refresh': str(refresh),
+                'access': str(refresh.access_token),
+                'username': user.username
+            })
+        
+        return Response(
+            {'error': 'Invalid credentials'}, 
+            status=status.HTTP_401_UNAUTHORIZED
+        )
+
+
+# ==================== MOOD ENTRY VIEWSET ====================
+
+class MoodEntryViewSet(viewsets.ModelViewSet):
+    """
+    Mental Health Mood Entry Management.
+    
+    Endpoints:
+    - GET /api/mood-entries/ - List all mood entries
+    - POST /api/mood-entries/ - Create new mood entry
+    - GET /api/mood-entries/{id}/ - Retrieve specific entry
+    - PUT/PATCH /api/mood-entries/{id}/ - Update entry
+    - DELETE /api/mood-entries/{id}/ - Delete entry
+    
+    Note: sentiment_score and DAS levels are auto-calculated by TextBlob AI.
+    Frontend should only send: note
+    """
+    serializer_class = MoodEntrySerializer
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get_queryset(self):
+        """Return only the authenticated user's mood entries."""
+        return MoodEntry.objects.filter(user=self.request.user)
+    
+    def perform_create(self, serializer):
+        """Auto-assign the authenticated user when creating."""
+        serializer.save(user=self.request.user)
+
+
+# ==================== SLEEP LOG VIEWSET ====================
+
+class SleepLogViewSet(viewsets.ModelViewSet):
+    """
+    Sleep Tracking Management.
+    
+    Endpoints:
+    - GET /api/sleep-logs/ - List all sleep logs
+    - POST /api/sleep-logs/ - Create new sleep log
+    - GET /api/sleep-logs/{id}/ - Retrieve specific log
+    - PUT/PATCH /api/sleep-logs/{id}/ - Update log
+    - DELETE /api/sleep-logs/{id}/ - Delete log
+    
+    POST Body Example:
+    {
+        "date": "2026-02-15",
+        "hours_slept": 7.5
+    }
+    """
+    serializer_class = SleepLogSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get_queryset(self):
+        """Return only the authenticated user's sleep logs."""
+        return SleepLog.objects.filter(user=self.request.user)
+    
+    def perform_create(self, serializer):
+        """Auto-assign the authenticated user when creating."""
+        serializer.save(user=self.request.user)
+
+
+# ==================== STUDY SESSION VIEWSET ====================
+
+class StudySessionViewSet(viewsets.ModelViewSet):
+    """
+    Study Session Tracking Management.
+    
+    Endpoints:
+    - GET /api/study-sessions/ - List all study sessions
+    - POST /api/study-sessions/ - Create new study session
+    - GET /api/study-sessions/{id}/ - Retrieve specific session
+    - PUT/PATCH /api/study-sessions/{id}/ - Update session
+    - DELETE /api/study-sessions/{id}/ - Delete session
+    
+    POST Body Example:
+    {
+        "subject": "Mathematics",
+        "start_time": "2026-02-15T14:00:00Z",
+        "end_time": "2026-02-15T16:30:00Z"
+    }
+    
+    Note: duration_minutes is auto-calculated from start_time and end_time.
+    """
+    serializer_class = StudySessionSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get_queryset(self):
+        """Return only the authenticated user's study sessions."""
+        return StudySession.objects.filter(user=self.request.user)
+    
+    def perform_create(self, serializer):
+        """Auto-assign the authenticated user when creating."""
+        serializer.save(user=self.request.user)
+
+
+# ==================== HOLISTIC WELLNESS SUMMARY VIEW ====================
+
+class WellnessSummaryView(APIView):
+    """
+    HOLISTIC WELLNESS DASHBOARD (Samsung Health-inspired).
+    
+    GET /api/wellness-summary/
+    
+    Provides a comprehensive 7-day wellness overview including:
+    - Mental health metrics (mood, DAS levels)
+    - Sleep patterns
+    - Study habits
+    - Holistic health score
+    - Academic context awareness
+    - Personalized AI recommendations
+    
+    This is the main endpoint for the frontend dashboard.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    
+    # Ideal targets for normalization
+    IDEAL_SLEEP_HOURS = 8.0
+    IDEAL_STUDY_MINUTES = 240.0  # 4 hours per day
+    
+    def _get_7_day_data(self, user):
+        """Fetch all wellness data for the past 7 days."""
+        today = timezone.now().date()
+        week_ago = today - timedelta(days=7)
+        
+        # Mood entries
+        mood_entries = MoodEntry.objects.filter(
+            user=user,
+            timestamp__date__gte=week_ago,
+            timestamp__date__lte=today
+        )
+        
+        # Sleep logs
+        sleep_logs = SleepLog.objects.filter(
+            user=user,
+            date__gte=week_ago,
+            date__lte=today
+        )
+        
+        # Study sessions
+        study_sessions = StudySession.objects.filter(
+            user=user,
+            start_time__date__gte=week_ago,
+            start_time__date__lte=today
+        )
+        
+        return mood_entries, sleep_logs, study_sessions
+    
+    def _calculate_mood_metrics(self, mood_entries):
+        """Calculate mood average and DAS status."""
+        scored_entries = mood_entries.exclude(sentiment_score__isnull=True)
+        
+        if scored_entries.exists():
+            mood_avg = scored_entries.aggregate(
+                avg=Avg('sentiment_score')
+            )['avg']
+            
+            # Determine overall DAS status (most common level)
+            das_levels = {
+                'depression': self._most_common_level(scored_entries, 'depression_level'),
+                'anxiety': self._most_common_level(scored_entries, 'anxiety_level'),
+                'stress': self._most_common_level(scored_entries, 'stress_level')
+            }
+            
+            return mood_avg, das_levels
+        
+        return None, {'depression': None, 'anxiety': None, 'stress': None}
+    
+    def _most_common_level(self, queryset, field_name):
+        """Find the most common DAS level in the queryset."""
+        counts = queryset.exclude(
+            **{f'{field_name}__isnull': True}
+        ).values(field_name).annotate(
+            count=Count(field_name)
+        ).order_by('-count')
+        
+        if counts:
+            return counts[0][field_name]
+        return None
+    
+    def _calculate_sleep_metrics(self, sleep_logs):
+        """Calculate average sleep hours."""
+        if sleep_logs.exists():
+            return sleep_logs.aggregate(avg=Avg('hours_slept'))['avg']
+        return None
+    
+    def _get_sleep_quality_distribution(self, sleep_logs):
+        """
+        Calculate distribution of sleep quality tags.
+        
+        Returns percentage breakdown of Good/Poor/Not Bad nights
+        over the 7-day period, plus absolute counts.
+        """
+        if not sleep_logs.exists():
+            return None
+        
+        total = sleep_logs.count()
+        good = sleep_logs.filter(quality_tag='Good').count()
+        poor = sleep_logs.filter(quality_tag='Poor').count()
+        not_bad = sleep_logs.filter(quality_tag='Not Bad').count()
+        
+        return {
+            'good_percent': round((good / total) * 100, 1) if total > 0 else 0,
+            'poor_percent': round((poor / total) * 100, 1) if total > 0 else 0,
+            'not_bad_percent': round((not_bad / total) * 100, 1) if total > 0 else 0,
+            'good_nights': good,
+            'poor_nights': poor,
+            'not_bad_nights': not_bad
+        }
+    
+    def _get_avg_interruptions(self, sleep_logs):
+        """
+        Calculate average sleep interruptions per night.
+        
+        Returns the mean interruption count across all logged nights
+        in the 7-day window.
+        """
+        if not sleep_logs.exists():
+            return None
+        
+        avg = sleep_logs.aggregate(avg=Avg('interruption_count'))['avg']
+        return round(avg, 1) if avg else 0
+    
+    def _calculate_study_metrics(self, study_sessions):
+        """Calculate average daily study minutes."""
+        if study_sessions.exists():
+            total_minutes = study_sessions.aggregate(
+                total=Sum('duration_minutes')
+            )['total']
+            # Average per day over 7 days
+            return total_minutes / 7.0
+        return None
+    
+    def _get_active_academic_event(self):
+        """Check for active academic events."""
+        today = timezone.now().date()
+        active_event = AcademicEvent.objects.filter(
+            start_date__lte=today,
+            end_date__gte=today
+        ).first()
+        
+        return active_event.event_name if active_event else None
+    
+    def _calculate_holistic_health_score(self, mood_avg, sleep_avg, study_avg):
+        """
+        Calculate Holistic Health Score (0-100 scale).
+        
+        Formula: Weighted average of normalized metrics
+        - Mood: 50% weight
+        - Sleep: 30% weight
+        - Study: 20% weight
+        """
+        # Normalize mood (-1 to 1) → (0 to 1)
+        mood_normalized = (mood_avg + 1) / 2 if mood_avg is not None else 0.5
+        
+        # Normalize sleep (0 to 8+) → (0 to 1)
+        sleep_normalized = min(sleep_avg / self.IDEAL_SLEEP_HOURS, 1.0) if sleep_avg else 0.5
+        
+        # Normalize study (0 to 240+) → (0 to 1)
+        study_normalized = min(study_avg / self.IDEAL_STUDY_MINUTES, 1.0) if study_avg else 0.5
+        
+        # Weighted average
+        health_score = (
+            mood_normalized * 0.5 +
+            sleep_normalized * 0.3 +
+            study_normalized * 0.2
+        ) * 100  # Scale to 0-100
+        
+        return round(health_score, 2)
+    
+    def _generate_personalized_recommendation(self, mood_avg, sleep_avg, study_avg, 
+                                              das_levels, active_event):
+        """
+        AI Decision Engine for Personalized Recommendations.
+        
+        Analyzes all wellness metrics to provide context-aware advice.
+        """
+        recommendations = []
+        
+        # High-priority recommendations first
+        
+        # Rule 1: High Anxiety + Active Academic Event
+        if das_levels['anxiety'] == 'High' and active_event:
+            recommendations.append(
+                f"🧘 High anxiety detected during {active_event}. "
+                "Try breathing exercises and the Pomodoro technique "
+                "(25 min study, 5 min break) to manage stress."
+            )
+        
+        # Rule 2: Poor Sleep + Low Mood
+        if sleep_avg and sleep_avg < 6.0 and mood_avg and mood_avg < -0.2:
+            recommendations.append(
+                "😴 Your sleep and mood are both low. "
+                "Prioritize sleep: Try a power nap (20 mins) and "
+                "reduce screen time 1 hour before bed."
+            )
+        
+        # Rule 3: Excessive Study + High Stress
+        if study_avg and study_avg > 240 and das_levels['stress'] == 'High':
+            recommendations.append(
+                "📚 You're studying a lot and showing high stress. "
+                "Take regular 10-minute breaks every hour. "
+                "Practice mindfulness or go for a short walk."
+            )
+        
+        # Rule 4: Low Study + Active Event
+        if study_avg and study_avg < 60 and active_event:
+            recommendations.append(
+                f"📖 Study time is low during {active_event}. "
+                "Consider creating a study schedule with specific goals."
+            )
+        
+        # Rule 5: Poor Sleep (General)
+        if sleep_avg and sleep_avg < 6.5 and not any('sleep' in r.lower() for r in recommendations):
+            recommendations.append(
+                "😴 Your sleep is below optimal (6.5+ hours recommended). "
+                "Establish a consistent bedtime routine."
+            )
+        
+        # Default: Positive reinforcement
+        if not recommendations:
+            if mood_avg and mood_avg > 0.2:
+                recommendations.append(
+                    "🌟 Keep up the great work! Your wellness metrics look positive. "
+                    "Consider exploring new hobbies or connecting with friends."
+                )
+            else:
+                recommendations.append(
+                    "👍 Your wellness metrics are stable. "
+                    "Continue monitoring your well-being and reach out for support if needed."
+                )
+        
+        return " | ".join(recommendations)
+    
+    def _get_primary_intervention(self, das_levels):
+        """
+        Primary Intervention Selector.
+
+        Maps the most urgent DAS level to a single action token the
+        Samsung Health-style dashboard uses to highlight the correct tile.
+
+        Priority order (highest → lowest):
+          anxiety  High  → BREATHING_EXERCISE
+          stress   High  → MINDFULNESS_BREAK
+          depression High → MOOD_JOURNAL
+          any      Moderate → WELLNESS_CHECK_IN
+          all      Low/None → None  (no urgent intervention needed)
+
+        Returns a string token or None.
+        """
+        anxiety    = das_levels.get('anxiety')
+        stress     = das_levels.get('stress')
+        depression = das_levels.get('depression')
+
+        if anxiety == 'High':
+            return 'BREATHING_EXERCISE'
+        if stress == 'High':
+            return 'MINDFULNESS_BREAK'
+        if depression == 'High':
+            return 'MOOD_JOURNAL'
+        if 'Moderate' in (anxiety, stress, depression):
+            return 'WELLNESS_CHECK_IN'
+        return None
+
+    def _get_recommended_resources(self, das_levels, sleep_avg):
+        """
+        Smart Resource Filtering — Samsung Health-style carousel.
+
+        Queries the WellnessResource table and returns up to MAX_CARDS
+        card dicts, ordered by relevance to the student's current state.
+
+        Priority rules (highest → lowest):
+          1. stress_level == 'High'  → surface cards tagged 'breathing'
+                                       then cards tagged 'meditation'
+          2. sleep_avg < 6 hours     → surface cards tagged 'sleep'
+          3. Fallback                → two Recovery cards, then two Mood,
+                                       then two Focus (default catalogue)
+
+        Each card dict shape:
+          { title, category, color, action, image_url, content_link }
+        ready for direct mapping to a frontend Card component.
+        """
+        MAX_CARDS  = 6
+        LOW_SLEEP  = 6.0          # hours threshold for sleep-hygiene rule
+        active_qs  = WellnessResource.objects.filter(is_active=True)
+
+        seen_ids  = []
+        resources = []
+
+        def _collect(qs):
+            """Append unseen cards from qs until MAX_CARDS is reached."""
+            for resource in qs:
+                if len(resources) >= MAX_CARDS:
+                    return
+                if resource.pk not in seen_ids:
+                    seen_ids.append(resource.pk)
+                    resources.append(resource.as_card())
+
+        # ── Rule 1: High stress → breathing first, then meditation ─────
+        if das_levels.get('stress') == 'High':
+            _collect(active_qs.filter(tags__icontains='breathing'))
+            _collect(active_qs.filter(tags__icontains='meditation'))
+
+        # ── Rule 2: Low sleep → sleep-hygiene resources ─────────────────
+        if sleep_avg is not None and sleep_avg < LOW_SLEEP:
+            _collect(active_qs.filter(tags__icontains='sleep'))
+
+        # ── Rule 3: Fallback — fill remaining slots from the catalogue ──
+        for category in ('Recovery', 'Mood', 'Focus'):
+            _collect(active_qs.filter(category=category)[:2])
+
+        return resources
+
+    def _check_mindfulness_alert(self, user):
+        """
+        Intervention Logic (Proactive Mental Health Feature).
+
+        Inspects the user's most recent MoodEntry and returns True when
+        anxiety_level is 'High'.  The frontend uses this flag to make the
+        Breathing tile glow/bounce so the student's attention is drawn to
+        an immediate coping action.
+
+        Returns:
+            bool – True if latest entry shows High anxiety, False otherwise.
+        """
+        latest = (
+            MoodEntry.objects
+            .filter(user=user)
+            .exclude(anxiety_level__isnull=True)
+            .order_by('-timestamp')
+            .first()
+        )
+        return latest is not None and latest.anxiety_level == 'High'
+
+    def get(self, request):
+        """
+        Main GET handler for Holistic Wellness Summary.
+        
+        Returns comprehensive wellness dashboard data.
+        """
+        user = request.user
+        
+        # ═══════════════════════════════════════════════════════════════
+        # STEP 1: Fetch 7-Day Data
+        # ═══════════════════════════════════════════════════════════════
+        mood_entries, sleep_logs, study_sessions = self._get_7_day_data(user)
+        
+        # ═══════════════════════════════════════════════════════════════
+        # STEP 2: Calculate Metrics
+        # ═══════════════════════════════════════════════════════════════
+        mood_avg, das_levels = self._calculate_mood_metrics(mood_entries)
+        sleep_avg = self._calculate_sleep_metrics(sleep_logs)
+        study_avg = self._calculate_study_metrics(study_sessions)
+        
+        # ═══════════════════════════════════════════════════════════════
+        # STEP 3: Get Academic Context
+        # ═══════════════════════════════════════════════════════════════
+        active_event = self._get_active_academic_event()
+        
+        # ═══════════════════════════════════════════════════════════════
+        # STEP 4: Calculate Holistic Health Score
+        # ═══════════════════════════════════════════════════════════════
+        health_score = self._calculate_holistic_health_score(
+            mood_avg, sleep_avg, study_avg
+        )
+        
+        # ═══════════════════════════════════════════════════════════════
+        # STEP 5: Generate Personalized Recommendation
+        # ═══════════════════════════════════════════════════════════════
+        recommendation = self._generate_personalized_recommendation(
+            mood_avg, sleep_avg, study_avg, das_levels, active_event
+        )
+        
+        # ═══════════════════════════════════════════════════════════════
+        # STEP 6: Proactive Intervention – Mindfulness Alert
+        # ═══════════════════════════════════════════════════════════════
+        trigger_mindfulness_alert = self._check_mindfulness_alert(user)
+
+        # ═══════════════════════════════════════════════════════════════
+        # STEP 7: Smart Resource Recommendations (Carousel Cards)
+        #         + Primary Intervention Token
+        # ═══════════════════════════════════════════════════════════════
+        recommended_resources  = self._get_recommended_resources(das_levels, sleep_avg)
+        primary_intervention   = self._get_primary_intervention(das_levels)
+
+        # ═══════════════════════════════════════════════════════════════
+        # STEP 8: Build Comprehensive Response
+        # ═══════════════════════════════════════════════════════════════
+        today = timezone.now().date()
+        week_ago = today - timedelta(days=7)
+        
+        response_data = {
+            # Period Information
+            'period': {
+                'from': week_ago.strftime('%Y-%m-%d'),
+                'to': today.strftime('%Y-%m-%d'),
+                'days': 7
+            },
+            
+            # Mental Health Metrics
+            'mood': {
+                'avg_score': round(mood_avg, 4) if mood_avg else None,
+                'entries_count': mood_entries.count(),
+                'status': 'Positive' if mood_avg and mood_avg > 0.2 else 
+                         'Low' if mood_avg and mood_avg < -0.2 else 'Stable'
+            },
+            
+            # DAS Levels
+            'mental_health': {
+                'depression_level': das_levels['depression'],
+                'anxiety_level': das_levels['anxiety'],
+                'stress_level': das_levels['stress']
+            },
+            
+            # Sleep Metrics (Enhanced with Quality Analysis)
+            'sleep': {
+                'avg_hours': round(sleep_avg, 2) if sleep_avg else None,
+                'logs_count': sleep_logs.count(),
+                'status': 'Good' if sleep_avg and sleep_avg >= 7 else
+                         'Poor' if sleep_avg and sleep_avg < 6 else 'Fair',
+                'quality_distribution': self._get_sleep_quality_distribution(sleep_logs),
+                'avg_interruptions': self._get_avg_interruptions(sleep_logs)
+            },
+            
+            # Study Metrics
+            'study': {
+                'avg_minutes_per_day': round(study_avg, 2) if study_avg else None,
+                'sessions_count': study_sessions.count(),
+                'status': 'Balanced' if study_avg and 120 <= study_avg <= 300 else
+                         'Low' if study_avg and study_avg < 120 else 'High'
+            },
+            
+            # Holistic Health Score (NEW)
+            'holistic_health_score': health_score,
+            
+            # Academic Context
+            'academic_context': {
+                'active_event_name': active_event,
+                'is_active': active_event is not None
+            },
+            
+            # AI-Generated Recommendation (text summary)
+            'personalized_recommendation': recommendation,
+
+            # Samsung Health-style Carousel Cards
+            # List of card dicts ordered by relevance to the student's
+            # current stress/sleep state.  Map each item directly to a
+            # Card component: title, category, color, action, image_url,
+            # content_link are all present on every object.
+            'recommended_resources': recommended_resources,
+
+            # Proactive Intervention Flag
+            # True  → latest MoodEntry has anxiety_level == 'High'
+            # False → anxiety is normal; no special UI treatment needed
+            'trigger_mindfulness_alert': trigger_mindfulness_alert,
+
+            # Primary Intervention Token (Samsung Health-style dashboard driver)
+            # Possible values:
+            #   'BREATHING_EXERCISE' → anxiety_level is High
+            #   'MINDFULNESS_BREAK'  → stress_level  is High
+            #   'MOOD_JOURNAL'       → depression_level is High
+            #   'WELLNESS_CHECK_IN'  → any level is Moderate
+            #   None                 → all levels Low; no urgent action
+            'primary_intervention': primary_intervention
+        }
+        
+        return Response(response_data)
+
+
+# ==================== MINDFULNESS ACTIONS VIEW ====================
+
+class MindfulnessActionsView(APIView):
+    """
+    Dynamic Mindfulness Activity Menu.
+    GET /api/mindfulness-actions/
+
+    Returns a prioritised list of mindfulness activities.  Two ordering
+    rules are applied before the list is returned, ensuring the most
+    relevant activity always appears first:
+
+    Priority 1 – Exam tomorrow:
+        An AcademicEvent whose start_date is tomorrow causes 'Stress Relief'
+        to move to position 0.
+
+    Priority 2 – High study load today:
+        Study sessions totalling > 120 minutes today causes 'Focus Meditation'
+        to move to position 0.
+
+    Both rules can be true simultaneously; exam-tomorrow wins (higher priority).
+    All other activities follow in their default order.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    # ------------------------------------------------------------------ #
+    # Default activity catalogue – edit descriptions / durations here.   #
+    # 'id' is the stable key the frontend uses to identify each tile.    #
+    # ------------------------------------------------------------------ #
+    DEFAULT_ACTIVITIES = [
+        {
+            'id': 'breathing',
+            'title': 'Breathing Exercise',
+            'description': '4-7-8 breathing to calm the nervous system quickly.',
+            'duration_minutes': 5,
+            'category': 'anxiety_relief',
+        },
+        {
+            'id': 'focus_meditation',
+            'title': 'Focus Meditation',
+            'description': 'Guided session to restore concentration after long study blocks.',
+            'duration_minutes': 10,
+            'category': 'focus',
+        },
+        {
+            'id': 'stress_relief',
+            'title': 'Stress Relief',
+            'description': 'Progressive muscle relaxation to decompress before exams.',
+            'duration_minutes': 15,
+            'category': 'stress_relief',
+        },
+        {
+            'id': 'body_scan',
+            'title': 'Body Scan',
+            'description': 'Head-to-toe awareness exercise to release tension.',
+            'duration_minutes': 12,
+            'category': 'relaxation',
+        },
+        {
+            'id': 'gratitude_journal',
+            'title': 'Gratitude Journaling',
+            'description': 'Write three things you appreciate today to shift your mindset.',
+            'duration_minutes': 7,
+            'category': 'mood_boost',
+        },
+        {
+            'id': 'walk_break',
+            'title': 'Mindful Walk Break',
+            'description': 'Step outside for a short, screen-free walk to reset your focus.',
+            'duration_minutes': 10,
+            'category': 'physical',
+        },
+    ]
+
+    # Thresholds
+    HIGH_STUDY_MINUTES_TODAY = 120   # > 2 h of study today = high load
+
+    def _has_exam_tomorrow(self):
+        """
+        Return (True, event_name) if any AcademicEvent starts tomorrow,
+        else (False, None).
+        """
+        tomorrow = timezone.now().date() + timedelta(days=1)
+        event = AcademicEvent.objects.filter(start_date=tomorrow).first()
+        if event:
+            return True, event.event_name
+        return False, None
+
+    def _study_load_is_high_today(self, user):
+        """
+        Return True if the user has logged more than HIGH_STUDY_MINUTES_TODAY
+        minutes of study sessions starting today.
+        """
+        today = timezone.now().date()
+        result = (
+            StudySession.objects
+            .filter(user=user, start_time__date=today)
+            .aggregate(total=Sum('duration_minutes'))
+        )
+        total = result['total'] or 0
+        return total > self.HIGH_STUDY_MINUTES_TODAY
+
+    def _build_ordered_list(self, exam_tomorrow, high_study_load):
+        """
+        Clone the catalogue and move the priority item to index 0.
+
+        Rule precedence (highest first):
+          1. Exam tomorrow   → 'stress_relief' to front
+          2. High study load → 'focus_meditation' to front
+          3. No special case → default order preserved
+        """
+        # Work on a fresh copy so the class-level list is never mutated
+        activities = [dict(a) for a in self.DEFAULT_ACTIVITIES]
+
+        # Determine which id (if any) should be promoted
+        if exam_tomorrow:
+            priority_id = 'stress_relief'
+        elif high_study_load:
+            priority_id = 'focus_meditation'
+        else:
+            return activities   # Nothing to reorder
+
+        # Pull the priority item out and reinsert at position 0
+        priority_item = next(
+            (a for a in activities if a['id'] == priority_id), None
+        )
+        if priority_item:
+            activities.remove(priority_item)
+            activities.insert(0, priority_item)
+
+        return activities
+
+    def get(self, request):
+        user = request.user
+        today = timezone.now().date()
+
+        # ── 1. Evaluate ordering signals ────────────────────────────────
+        exam_tomorrow, exam_name = self._has_exam_tomorrow()
+        high_study_load = self._study_load_is_high_today(user)
+
+        # ── 2. Build the ordered activity list ──────────────────────────
+        activities = self._build_ordered_list(exam_tomorrow, high_study_load)
+
+        # ── 3. Build context block so the frontend can explain ordering ──
+        ordering_context = {
+            'exam_tomorrow': exam_tomorrow,
+            'exam_name': exam_name,             # None when no exam
+            'high_study_load_today': high_study_load,
+            'priority_reason': (
+                f"'Stress Relief' promoted: {exam_name} starts tomorrow."
+                if exam_tomorrow else
+                "'Focus Meditation' promoted: high study load today."
+                if high_study_load else
+                "Default order – no special conditions detected."
+            ),
+        }
+
+        return Response({
+            'date': today.strftime('%Y-%m-%d'),
+            'ordering_context': ordering_context,
+            'activities': activities,
+        })
+
+# ==================== ENHANCED WELLNESS SUMMARY ====================
+
+class SuperDuperWellnessSummaryView(APIView):
+    """
+    ENHANCED Wellness Summary with ALL Super Duper UX Features.
+    
+    Extends the base wellness-summary with:
+    - Streak tracking
+    - Pattern detection
+    - Personal insights
+    - Crisis detection
+    - Community stats
+    - Care packages
+    - Behavioral predictions
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get(self, request):
+        user = request.user
+        today = timezone.now().date()
+        week_ago = today - timedelta(days=7)
+        
+        # ═══════════════════════════════════════════════════════════════
+        # BASE DATA (from original wellness-summary)
+        # ═══════════════════════════════════════════════════════════════
+        mood_entries = MoodEntry.objects.filter(
+            user=user, timestamp__date__gte=week_ago
+        )
+        
+        # Calculate base metrics
+        mood_avg = mood_entries.aggregate(avg=Avg('sentiment_score'))['avg']
+        das_levels = self._calculate_das_levels(mood_entries)
+        
+        # ═══════════════════════════════════════════════════════════════
+        # GAMIFICATION: Streaks & Stats
+        # ═══════════════════════════════════════════════════════════════
+        stats, _ = UserStats.objects.get_or_create(user=user)
+        
+        streak_info = {
+            'current_streak': stats.current_streak,
+            'longest_streak': stats.longest_streak,
+            'total_checkins': stats.total_checkins,
+            'streak_milestone': self._get_streak_milestone(stats.current_streak),
+            'days_until_next_milestone': self._days_to_next_milestone(stats.current_streak)
+        }
+        
+        # ═══════════════════════════════════════════════════════════════
+        # PATTERN DETECTION
+        # ═══════════════════════════════════════════════════════════════
+        detected_patterns = self._detect_patterns(user)
+        active_patterns = DetectedPattern.objects.filter(
+            user=user, is_active=True, acknowledged=False
+        )[:3]  # Top 3 unacknowledged
+        
+        patterns_info = {
+            'newly_detected': detected_patterns,
+            'active_patterns': [
+                {
+                    'id': p.id,
+                    'type': p.pattern_type,
+                    'message': p.get_insight_message(),
+                    'confidence': p.confidence
+                }
+                for p in active_patterns
+            ]
+        }
+        
+        # ═══════════════════════════════════════════════════════════════
+        # PERSONAL INSIGHTS
+        # ═══════════════════════════════════════════════════════════════
+        insights = self._generate_weekly_insights(user)
+        unread_insights = PersonalInsight.objects.filter(
+            user=user, viewed=False
+        ).order_by('priority')[:5]
+        
+        insights_info = {
+            'unread_count': unread_insights.count(),
+            'top_insights': [
+                {
+                    'id': i.id,
+                    'title': i.title,
+                    'message': i.message,
+                    'type': i.insight_type,
+                    'priority': i.priority
+                }
+                for i in unread_insights
+            ]
+        }
+        
+        # ═══════════════════════════════════════════════════════════════
+        # CRISIS DETECTION
+        # ═══════════════════════════════════════════════════════════════
+        crisis_check = self._check_crisis_indicators(user)
+        
+        if crisis_check['show_resources']:
+            # Log crisis checkpoint
+            CrisisCheckpoint.objects.create(
+                user=user,
+                severity=crisis_check['severity'],
+                indicators=crisis_check['indicators'],
+                resources_shown=crisis_check['resources']
+            )
+        
+        # ═══════════════════════════════════════════════════════════════
+        # CARE PACKAGE (PRE-EXAM SUPPORT)
+        # ═══════════════════════════════════════════════════════════════
+        care_package = self._check_care_package(user)
+        
+        # ═══════════════════════════════════════════════════════════════
+        # COMMUNITY STATS (SOCIAL PROOF)
+        # ═══════════════════════════════════════════════════════════════
+        community = self._get_community_stats(today)
+        
+        # ═══════════════════════════════════════════════════════════════
+        # MICRO-COMMITMENTS (ACTIVE)
+        # ═══════════════════════════════════════════════════════════════
+        active_commitments = MicroCommitment.objects.filter(
+            user=user,
+            completed_at__isnull=True,
+            committed_at__gte=timezone.now() - timedelta(hours=24)
+        )
+        
+        commitments_info = {
+            'active_count': active_commitments.count(),
+            'pending': [
+                {
+                    'id': c.id,
+                    'type': c.commitment_type,
+                    'label': c.get_commitment_type_display(),
+                    'committed_at': c.committed_at.isoformat()
+                }
+                for c in active_commitments
+            ]
+        }
+        
+        # ═════════════════════════════════════════════════════════════
+        # BEHAVIORAL PREDICTIONS
+        # ═══════════════════════════════════════════════════════════════
+        predictions = self._get_predictions(user)
+        
+        # ═══════════════════════════════════════════════════════════════
+        # BUILD ENHANCED RESPONSE
+        # ═══════════════════════════════════════════════════════════════
+        response_data = {
+            # Original wellness summary data would go here
+            # (mood, sleep, study, health_score, etc.)
+            
+            # NEW: Gamification
+            'streaks': streak_info,
+            
+            # NEW: Pattern Detection
+            'patterns': patterns_info,
+            
+            # NEW: Personal Insights
+            'insights': insights_info,
+            
+            # NEW: Crisis Support
+            'crisis_support': {
+                'show_resources': crisis_check['show_resources'],
+                'severity': crisis_check.get('severity'),
+                'resources': crisis_check.get('resources', []),
+                'message': crisis_check.get('message')
+            },
+            
+            # NEW: Care Package
+            'care_package': care_package,
+            
+            # NEW: Community Stats
+            'community': community,
+            
+            # NEW: Micro-Commitments
+            'commitments': commitments_info,
+            
+            # NEW: Predictions
+            'predictions': predictions,
+            
+            # Enhanced metadata
+            'meta': {
+                'generated_at': timezone.now().isoformat(),
+                'user_timezone': 'UTC',  # Get from user preferences
+                'personalization_level': self._get_personalization_level(user)
+            }
+        }
+        
+        return Response(response_data)
+    
+    # ═══════════════════════════════════════════════════════════════
+    # HELPER METHODS
+    # ═══════════════════════════════════════════════════════════════
+    
+    def _calculate_das_levels(self, mood_entries):
+        """Calculate average DAS levels from mood entries."""
+        if not mood_entries.exists():
+            return {'depression': 'Low', 'anxiety': 'Low', 'stress': 'Low'}
+        
+        # Most recent entry's DAS levels
+        latest = mood_entries.first()
+        return {
+            'depression': latest.depression_level or 'Low',
+            'anxiety': latest.anxiety_level or 'Low',
+            'stress': latest.stress_level or 'Low'
+        }
+    
+    def _get_streak_milestone(self, streak):
+        """Return milestone message based on streak."""
+        milestones = {
+            3: "🔥 3-day streak! Building the habit.",
+            7: "⭐ 1 week streak! You're consistent!",
+            14: "💪 2 weeks! This is becoming routine.",
+            30: "🎉 1 MONTH! You're crushing it!",
+            60: "🏆 2 months! Wellness champion!",
+            90: "👑 3 months! Incredible dedication!",
+        }
+        
+        for days, message in sorted(milestones.items(), reverse=True):
+            if streak >= days:
+                return message
+        
+        return "Keep logging to build your streak!"
+    
+    def _days_to_next_milestone(self, streak):
+        """Days until next milestone."""
+        milestones = [3, 7, 14, 30, 60, 90, 180, 365]
+        for milestone in milestones:
+            if streak < milestone:
+                return milestone - streak
+        return None  # Already past all milestones
+    
+    def _detect_patterns(self, user):
+        """
+        ML Pattern Detection.
+        
+        Analyzes historical data to find recurring patterns.
+        """
+        detected = []
+        
+        # Pattern 1: Weekly anxiety spike
+        weekly_pattern = self._detect_weekly_spike(user)
+        if weekly_pattern:
+            detected.append(weekly_pattern)
+        
+        # Pattern 2: Sleep-mood correlation
+        sleep_correlation = self._detect_sleep_mood_correlation(user)
+        if sleep_correlation:
+            detected.append(sleep_correlation)
+        
+        # Pattern 3: Pre-exam stress
+        exam_pattern = self._detect_pre_exam_pattern(user)
+        if exam_pattern:
+            detected.append(exam_pattern)
+        
+        # Save new patterns to database
+        for pattern_data in detected:
+            DetectedPattern.objects.get_or_create(
+                user=user,
+                pattern_type=pattern_data['type'],
+                defaults={
+                    'confidence': pattern_data['confidence'],
+                    'metadata': pattern_data['metadata']
+                }
+            )
+        
+        return detected
+    
+    def _detect_weekly_spike(self, user):
+        """Detect if anxiety spikes on specific day of week."""
+        entries = MoodEntry.objects.filter(
+            user=user,
+            timestamp__gte=timezone.now() - timedelta(days=30)
+        )
+        
+        # Group by day of week
+        day_anxiety = {}
+        for entry in entries:
+            day = entry.timestamp.strftime('%A')
+            if day not in day_anxiety:
+                day_anxiety[day] = []
+            
+            # Convert anxiety_level to numeric
+            anxiety_score = {'Low': 1, 'Moderate': 2, 'High': 3}.get(
+                entry.anxiety_level, 1
+            )
+            day_anxiety[day].append(anxiety_score)
+        
+        # Find day with highest avg anxiety
+        if day_anxiety:
+            day_avgs = {day: sum(scores)/len(scores) 
+                       for day, scores in day_anxiety.items()}
+            worst_day = max(day_avgs, key=day_avgs.get)
+            avg_anxiety = day_avgs[worst_day]
+            
+            # Trigger if worst day is significantly higher (>1.5 avg)
+            if avg_anxiety >= 2.0 and len(day_anxiety[worst_day]) >= 3:
+                return {
+                    'type': 'weekly_spike',
+                    'confidence': min(len(day_anxiety[worst_day]) / 4, 1.0),
+                    'metadata': {
+                        'day': worst_day,
+                        'avg_anxiety': round(avg_anxiety, 2),
+                        'occurrences': len(day_anxiety[worst_day])
+                    }
+                }
+        
+        return None
+    
+    def _detect_sleep_mood_correlation(self, user):
+        """Detect correlation between sleep and next-day mood."""
+        from .models import SleepLog
+        
+        sleep_logs = SleepLog.objects.filter(
+            user=user,
+            date__gte=timezone.now().date() - timedelta(days=30)
+        )
+        
+        correlations = []
+        for log in sleep_logs:
+            next_day = log.date + timedelta(days=1)
+            mood = MoodEntry.objects.filter(
+                user=user,
+                timestamp__date=next_day
+            ).first()
+            
+            if mood and mood.sentiment_score is not None:
+                correlations.append({
+                    'sleep': log.hours_slept,
+                    'mood': mood.sentiment_score
+                })
+        
+        # Calculate correlation
+        if len(correlations) >= 5:
+            good_sleep = [c for c in correlations if c['sleep'] >= 7]
+            poor_sleep = [c for c in correlations if c['sleep'] < 6]
+            
+            if good_sleep and poor_sleep:
+                avg_mood_good = sum(c['mood'] for c in good_sleep) / len(good_sleep)
+                avg_mood_poor = sum(c['mood'] for c in poor_sleep) / len(poor_sleep)
+                
+                improvement = avg_mood_good - avg_mood_poor
+                
+                if improvement > 0.2:  # Significant improvement
+                    return {
+                        'type': 'sleep_mood_correlation',
+                        'confidence': min(len(correlations) / 10, 1.0),
+                        'metadata': {
+                            'sleep_hours': 7,
+                            'mood_improvement': f"{improvement*100:.0f}%",
+                            'sample_size': len(correlations)
+                        }
+                    }
+        
+        return None
+    
+    def _detect_pre_exam_pattern(self, user):
+        """Detect stress pattern before exams."""
+        # Get past exams
+        past_exams = AcademicEvent.objects.filter(
+            end_date__lt=timezone.now().date(),
+            end_date__gte=timezone.now().date() - timedelta(days=60)
+        )
+        
+        stress_before_exam = []
+        for exam in past_exams:
+            # Check mood 2 days before exam
+            two_days_before = exam.start_date - timedelta(days=2)
+            mood = MoodEntry.objects.filter(
+                user=user,
+                timestamp__date=two_days_before,
+                stress_level='High'
+            ).first()
+            
+            if mood:
+                stress_before_exam.append(exam)
+        
+        # If stressed before 2+ exams, it's a pattern
+        if len(stress_before_exam) >= 2:
+            return {
+                'type': 'pre_exam_stress',
+                'confidence': min(len(stress_before_exam) / 3, 1.0),
+                'metadata': {
+                    'days_before': 2,
+                    'occurrences': len(stress_before_exam)
+                }
+            }
+        
+        return None
+    
+    def _generate_weekly_insights(self, user):
+        """Generate personal insights for the week."""
+        today = timezone.now().date()
+        week_start = today - timedelta(days=7)
+        
+        insights = []
+        
+        # Insight 1: Week-over-week comparison
+        this_week_mood = MoodEntry.objects.filter(
+            user=user,
+            timestamp__date__gte=week_start
+        ).aggregate(avg=Avg('sentiment_score'))['avg']
+        
+        last_week_mood = MoodEntry.objects.filter(
+            user=user,
+            timestamp__date__gte=week_start - timedelta(days=7),
+            timestamp__date__lt=week_start
+        ).aggregate(avg=Avg('sentiment_score'))['avg']
+        
+        if this_week_mood and last_week_mood:
+            change = this_week_mood - last_week_mood
+            if abs(change) > 0.1:
+                direction = "improved" if change > 0 else "declined"
+                insights.append({
+                    'type': 'trend',
+                    'title': f'Your mood {direction} this week',
+                    'message': f'Compared to last week, your average mood {direction} by {abs(change)*100:.0f}%.',
+                    'priority': 2,
+                    'data_points': {
+                        'this_week': round(this_week_mood, 2),
+                        'last_week': round(last_week_mood, 2)
+                    }
+                })
+        
+        # Save insights to database
+        for insight_data in insights:
+            PersonalInsight.objects.create(
+                user=user,
+                insight_type=insight_data['type'],
+                title=insight_data['title'],
+                message=insight_data['message'],
+                priority=insight_data['priority'],
+                data_points=insight_data.get('data_points', {}),
+                for_week_starting=week_start
+            )
+        
+        return insights
+    
+    def _check_crisis_indicators(self, user):
+        """Check for crisis indicators and return resources if needed."""
+        today = timezone.now().date()
+        
+        indicators = []
+        severity = 'low'
+        
+        # Indicator 1: Multiple high anxiety entries today
+        high_anxiety_today = MoodEntry.objects.filter(
+            user=user,
+            timestamp__date=today,
+            anxiety_level='High'
+        ).count()
+        
+        if high_anxiety_today >= 3:
+            indicators.append('3_high_anxiety_today')
+            severity = 'high'
+        
+        # Indicator 2: Consecutive days of poor sleep
+        from .models import SleepLog
+        poor_sleep_days = SleepLog.objects.filter(
+            user=user,
+            date__gte=today - timedelta(days=3),
+            hours_slept__lt=4
+        ).count()
+        
+        if poor_sleep_days >= 3:
+            indicators.append('sleep_<4h_3days')
+            severity = 'medium' if severity == 'low' else 'high'
+        
+        # Indicator 3: Severe negative sentiment
+        severe_negative = MoodEntry.objects.filter(
+            user=user,
+            timestamp__gte=timezone.now() - timedelta(days=2),
+            sentiment_score__lt=-0.7
+        ).count()
+        
+        if severe_negative >= 2:
+            indicators.append('severe_negative_sentiment')
+            severity = 'high'
+        
+        # Return crisis resources if any indicators found
+        if indicators:
+            return {
+                'show_resources': True,
+                'severity': severity,
+                'indicators': indicators,
+                'resources': [
+                    {
+                        'name': 'Campus Counseling',
+                        'phone': '1-800-XXX-XXXX',
+                        'hours': 'M-F 9am-5pm',
+                        'type': 'phone'
+                    },
+                    {
+                        'name': 'Crisis Text Line',
+                        'contact': 'Text HOME to 741741',
+                        'hours': '24/7',
+                        'type': 'text'
+                    },
+                    {
+                        'name': 'National Suicide Prevention Lifeline',
+                        'phone': '988',
+                        'hours': '24/7',
+                        'type': 'phone'
+                    }
+                ],
+                'message': "We've noticed you're going through a tough time. Please reach out to someone who can help."
+            }
+        
+        return {'show_resources': False}
+    
+    def _check_care_package(self, user):
+        """Check if user needs a pre-exam care package."""
+        tomorrow = timezone.now().date() + timedelta(days=1)
+        
+        # Check for exams starting tomorrow
+        upcoming_event = AcademicEvent.objects.filter(
+            start_date=tomorrow
+        ).first()
+        
+        if upcoming_event:
+            # Check if care package already created
+            existing = CarePackage.objects.filter(
+                user=user,
+                academic_event=upcoming_event
+            ).exists()
+            
+            if not existing:
+                # Create care package
+                package = CarePackage.objects.create(
+                    user=user,
+                    academic_event=upcoming_event,
+                    event_starts_at=upcoming_event.start_date,
+                    resources_included=[1, 2, 3],  # IDs of helpful resources
+                    tips=[
+                        'Get 8 hours of sleep tonight',
+                        'Eat a healthy breakfast',
+                        'Arrive 15 minutes early',
+                        'Take deep breaths if anxious'
+                    ],
+                    sleep_goal_adjusted=True,
+                    new_sleep_goal=8.0
+                )
+                
+                return {
+                    'available': True,
+                    'event_name': upcoming_event.event_name,
+                    'starts': upcoming_event.start_date.isoformat(),
+                    'tips': package.tips,
+                    'resources_count': len(package.resources_included),
+                    'message': f"📚 {upcoming_event.event_name} starts tomorrow. We've prepared a care package to help you succeed."
+                }
+        
+        return {'available': False}
+    
+    def _get_community_stats(self, date):
+        """Get community statistics for social proof."""
+        snapshot = CommunitySnapshot.objects.filter(
+            snapshot_date=date
+        ).first()
+        
+        if snapshot:
+            return {
+                'active_users_today': snapshot.active_users_count,
+                'avg_anxiety': snapshot.avg_anxiety_level,
+                'breathing_sessions_today': snapshot.breathing_exercises_count,
+                'message': f"Right now, {snapshot.active_users_count} students are using the app. You're not alone."
+            }
+        
+        # Fallback if no snapshot
+        active_now = MoodEntry.objects.filter(
+            timestamp__gte=timezone.now() - timedelta(hours=1)
+        ).values('user').distinct().count()
+        
+        return {
+            'active_users_today': active_now,
+            'message': f"{active_now} students checked in recently. You're part of a caring community."
+        }
+    
+    def _get_predictions(self, user):
+        """Predict upcoming challenges based on patterns."""
+        predictions = []
+        
+        # Predict stress based on detected patterns
+        patterns = DetectedPattern.objects.filter(
+            user=user,
+            is_active=True,
+            pattern_type='weekly_spike'
+        ).first()
+        
+        if patterns:
+            spike_day = patterns.metadata.get('day')
+            today_name = timezone.now().strftime('%A')
+            
+            # If spike day is tomorrow
+            tomorrow_name = (timezone.now() + timedelta(days=1)).strftime('%A')
+            if spike_day == tomorrow_name:
+                predictions.append({
+                    'type': 'anxiety_spike',
+                    'when': 'tomorrow',
+                    'confidence': patterns.confidence,
+                    'message': f"Based on your pattern, anxiety may increase tomorrow ({spike_day}). Plan self-care ahead.",
+                    'suggestions': ['breathing_exercise', 'light_schedule', 'support_system']
+                })
+        
+        return predictions
+    
+    def _get_personalization_level(self, user):
+        """Calculate how personalized the experience is (0-100)."""
+        stats = UserStats.objects.filter(user=user).first()
+        if not stats:
+            return 0
+        
+        # Base on data collected
+        data_points = stats.total_checkins
+        patterns = DetectedPattern.objects.filter(user=user, is_active=True).count()
+        insights = PersonalInsight.objects.filter(user=user).count()
+        
+        # Score out of 100
+        score = min(100, (data_points * 2) + (patterns * 10) + (insights * 5))
+        return score
+
+
+# ==================== MICRO-COMMITMENT TRACKING ====================
+
+class MicroCommitmentViewSet(viewsets.ModelViewSet):
+    """
+    API for managing micro-commitments.
+    
+    Endpoints:
+    - POST /api/micro-commitments/ - Create commitment
+    - PATCH /api/micro-commitments/{id}/complete/ - Mark complete
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get_queryset(self):
+        return MicroCommitment.objects.filter(user=self.request.user)
+    
+    def create(self, request):
+        """Create a new micro-commitment."""
+        mood_entry_id = request.data.get('mood_entry_id')
+        commitment_type = request.data.get('commitment_type')
+        
+        commitment = MicroCommitment.objects.create(
+            user=request.user,
+            mood_entry_id=mood_entry_id,
+            commitment_type=commitment_type
+        )
+        
+        return Response({
+            'id': commitment.id,
+            'type': commitment.commitment_type,
+            'label': commitment.get_commitment_type_display(),
+            'committed_at': commitment.committed_at.isoformat(),
+            'message': 'Great choice! You can do this. 💪'
+        }, status=status.HTTP_201_CREATED)
+    
+    @action(detail=True, methods=['post'])
+    def complete(self, request, pk=None):
+        """Mark commitment as completed."""
+        commitment = self.get_object()
+        commitment.mark_complete()
+        
+        # Positive reinforcement message
+        messages = [
+            "🎉 You did it! Every small step matters.",
+            "✨ Great job completing that! You're taking care of yourself.",
+            "💪 Awesome! That took courage. Proud of you.",
+            "🌟 You followed through! That's real progress."
+        ]
+        
+        import random
+        message = random.choice(messages)
+        
+        return Response({
+            'completed': True,
+            'completed_at': commitment.completed_at.isoformat(),
+            'time_to_complete_minutes': commitment.time_to_complete,
+            'message': message
+        })
+
+
+# ==================== PATTERN ACKNOWLEDGMENT ====================
+
+class PatternViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    View detected patterns.
+    
+    Endpoints:
+    - GET /api/patterns/ - List active patterns
+    - POST /api/patterns/{id}/acknowledge/ - Acknowledge pattern
+    - POST /api/patterns/{id}/dismiss/ - Dismiss pattern
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get_queryset(self):
+        return DetectedPattern.objects.filter(
+            user=self.request.user,
+            is_active=True
+        )
+    
+    @action(detail=True, methods=['post'])
+    def acknowledge(self, request, pk=None):
+        """User acknowledges they've seen the pattern."""
+        pattern = self.get_object()
+        pattern.acknowledged = True
+        pattern.acknowledged_at = timezone.now()
+        pattern.save()
+        
+        return Response({'acknowledged': True})
+    
+    @action(detail=True, methods=['post'])
+    def dismiss(self, request, pk=None):
+        """User dismisses pattern as not helpful."""
+        pattern = self.get_object()
+        pattern.is_active = False
+        pattern.helpful = False
+        pattern.save()
+        
+        return Response({'dismissed': True})
+    
+    @action(detail=True, methods=['post'])
+    def mark_helpful(self, request, pk=None):
+        """User marks pattern as helpful."""
+        pattern = self.get_object()
+        pattern.helpful = True
+        pattern.save()
+        
+        return Response({'marked_helpful': True})
+
+
+# ==================== INSIGHTS ====================
+
+class InsightsViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Personal insights endpoint.
+    
+    GET /api/insights/ - List unread insights
+    POST /api/insights/{id}/mark_read/ - Mark as read
+    POST /api/insights/{id}/rate/ - Rate helpfulness
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get_queryset(self):
+        return PersonalInsight.objects.filter(user=self.request.user)
+    
+    @action(detail=True, methods=['post'])
+    def mark_read(self, request, pk=None):
+        insight = self.get_object()
+        insight.viewed = True
+        insight.viewed_at = timezone.now()
+        insight.save()
+        
+        return Response({'viewed': True})
+    
+    @action(detail=True, methods=['post'])
+    def rate(self, request, pk=None):
+        """Rate insight helpfulness (1-5)."""
+        insight = self.get_object()
+        rating = request.data.get('rating', 3)
+        
+        if 1 <= rating <= 5:
+            insight.helpful_rating = rating
+            insight.save()
+            return Response({'rated': True, 'rating': rating})
+        
+        return Response(
+            {'error': 'Rating must be 1-5'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+
+# ==================== BACKGROUND TASKS (Celery) ====================
+
+# These would run as scheduled tasks in production
+
+def generate_community_snapshot():
+    """
+    Daily task to generate community snapshot.
+    Run at midnight via Celery beat.
+    """
+    from django.db.models import Avg
+    
+    today = timezone.now().date()
+    
+    # Aggregate stats
+    active_users = MoodEntry.objects.filter(
+        timestamp__date=today
+    ).values('user').distinct().count()
+    
+    total_moods = MoodEntry.objects.filter(
+        timestamp__date=today
+    ).count()
+    
+    avg_anxiety = MoodEntry.objects.filter(
+        timestamp__date=today
+    ).aggregate(
+        avg=Avg(
+            models.Case(
+                models.When(anxiety_level='Low', then=1),
+                models.When(anxiety_level='Moderate', then=2),
+                models.When(anxiety_level='High', then=3),
+                default=1,
+                output_field=models.FloatField()
+            )
+        )
+    )['avg']
+    
+    # Active events today
+    active_events = list(
+        AcademicEvent.objects.filter(
+            start_date__lte=today,
+            end_date__gte=today
+        ).values_list('event_name', flat=True)
+    )
+    
+    # Create snapshot
+    CommunitySnapshot.objects.create(
+        snapshot_date=today,
+        active_users_count=active_users,
+        total_mood_entries=total_moods,
+        avg_anxiety_level=avg_anxiety,
+        active_events=active_events
+    )
+    
+    print(f"✓ Community snapshot created for {today}")
+
+
+def cleanup_old_deleted_entries():
+    """
+    Daily task to permanently delete old soft-deleted entries.
+    Run daily via Celery beat.
+    """
+    from .models import DeletedMoodEntry
+    
+    cutoff = timezone.now()
+    old_entries = DeletedMoodEntry.objects.filter(
+        permanent_delete_at__lt=cutoff,
+        restored=False
+    )
+    
+    count = old_entries.count()
+    old_entries.delete()
+    
+    print(f"✓ Permanently deleted {count} old entries")
+
+
