@@ -168,6 +168,42 @@ class LoginView(APIView):
         )
 
 
+# ==================== USER PROFILE VIEW (Fix #3) ====================
+
+class UserProfileView(APIView):
+    """
+    Get or update the logged-in user's profile.
+    GET  /auth/profile/
+    PATCH /auth/profile/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        u = request.user
+        return Response({
+            'id': u.id,
+            'username': u.username,
+            'email': u.email,
+            'first_name': u.first_name,
+            'last_name': u.last_name,
+            'date_joined': u.date_joined,
+        })
+
+    def patch(self, request):
+        u = request.user
+        u.email      = request.data.get('email',      u.email)
+        u.first_name = request.data.get('first_name', u.first_name)
+        u.last_name  = request.data.get('last_name',  u.last_name)
+        u.save()
+        return Response({
+            'id': u.id,
+            'username': u.username,
+            'email': u.email,
+            'first_name': u.first_name,
+            'last_name': u.last_name,
+        })
+
+
 # ==================== MOOD ENTRY VIEWSET ====================
 
 class MoodEntryViewSet(viewsets.ModelViewSet):
@@ -291,6 +327,28 @@ class StudySessionViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         """Auto-assign the authenticated user when creating."""
         serializer.save(user=self.request.user)
+
+    @action(detail=True, methods=['post'])
+    def start(self, request, pk=None):
+        """
+        Mark a study session as started (sets start_time to now).
+        POST /api/study-sessions/{id}/start/
+        """
+        session = self.get_object()
+        session.start_time = timezone.now()
+        session.save()
+        return Response({'status': 'started', 'start_time': session.start_time})
+
+    @action(detail=True, methods=['post'])
+    def end(self, request, pk=None):
+        """
+        Mark a study session as ended (sets end_time to now, auto-calculates duration).
+        POST /api/study-sessions/{id}/end/
+        """
+        session = self.get_object()
+        session.end_time = timezone.now()
+        session.save()
+        return Response({'status': 'ended', 'end_time': session.end_time, 'duration_minutes': session.duration_minutes})
 
 
 # ==================== HOLISTIC WELLNESS SUMMARY VIEW ====================
@@ -3779,8 +3837,58 @@ class JournalingViewSet(viewsets.ViewSet):
         return Response({
             'is_favorite': entry.is_favorite
         })
- 
- 
+
+    # ── REST-style methods so frontend can call GET/POST /journal/
+    #    and GET/PATCH/DELETE /journal/{id}/ directly ──────────────
+
+    def list(self, request):
+        """GET /api/journal/ — list entries (alias for entries action)."""
+        return self.entries(request)
+
+    def create(self, request):
+        """POST /api/journal/ — create entry (alias for write action)."""
+        return self.write(request)
+
+    def retrieve(self, request, pk=None):
+        """GET /api/journal/{id}/ — get full entry (alias for entry_detail)."""
+        return self.entry_detail(request, pk=pk)
+
+    def partial_update(self, request, pk=None):
+        """PATCH /api/journal/{id}/ — update title, content, mood_tag, is_favorite."""
+        try:
+            entry = JournalEntry.objects.get(id=pk, user=request.user)
+        except JournalEntry.DoesNotExist:
+            return Response({'error': 'Entry not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        if 'title' in request.data:
+            entry.title = request.data['title']
+        if 'content' in request.data:
+            entry.content = request.data['content'].strip()
+        if 'mood_tag' in request.data:
+            entry.mood_tag = request.data['mood_tag']
+        if 'is_favorite' in request.data:
+            entry.is_favorite = bool(request.data['is_favorite'])
+        entry.save()
+
+        return Response({
+            'id': entry.id,
+            'title': entry.title,
+            'mood_tag': entry.mood_tag,
+            'word_count': entry.word_count,
+            'is_favorite': entry.is_favorite,
+            'written_at': entry.written_at,
+        })
+
+    def destroy(self, request, pk=None):
+        """DELETE /api/journal/{id}/ — delete entry."""
+        try:
+            entry = JournalEntry.objects.get(id=pk, user=request.user)
+        except JournalEntry.DoesNotExist:
+            return Response({'error': 'Entry not found'}, status=status.HTTP_404_NOT_FOUND)
+        entry.delete()
+        return Response({'message': 'Entry deleted.'}, status=status.HTTP_204_NO_CONTENT)
+
+
 # ==================== WELLNESS BUDDY API ====================
  
 class WellnessBuddyViewSet(viewsets.ViewSet):
@@ -3945,3 +4053,92 @@ class WellnessBuddyViewSet(viewsets.ViewSet):
         return Response({
             'message': 'Encouragement sent! 💙'
         })
+
+    @action(detail=False, methods=['get'])
+    def list_requests(self, request):
+        """
+        List pending buddy requests for the logged-in user.
+        GET /api/buddies/requests/
+        """
+        pending = WellnessBuddy.objects.filter(buddy=request.user, status='pending')
+        data = [
+            {
+                'id': r.id,
+                'from_user': {
+                    'id': r.user.id,
+                    'name': r.user.get_full_name() or r.user.username,
+                },
+                'requested_at': r.connected_at,
+            }
+            for r in pending
+        ]
+        return Response({'requests': data, 'total': len(data)})
+
+    @action(detail=True, methods=['post'])
+    def decline_request(self, request, pk=None):
+        """
+        Decline a pending buddy request.
+        POST /api/buddies/requests/{id}/decline/
+        """
+        try:
+            buddy_request = WellnessBuddy.objects.get(
+                id=pk, buddy=request.user, status='pending'
+            )
+        except WellnessBuddy.DoesNotExist:
+            return Response({'error': 'Request not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        buddy_request.status = 'declined'
+        buddy_request.save()
+        return Response({'message': 'Request declined.'})
+
+    @action(detail=True, methods=['delete'])
+    def remove_buddy(self, request, pk=None):
+        """
+        Remove a wellness buddy connection.
+        DELETE /api/buddies/{id}/
+        """
+        try:
+            connection = WellnessBuddy.objects.get(
+                id=pk,
+                status='accepted'
+            )
+            # Only allow either side of the connection to remove
+            if connection.user != request.user and connection.buddy != request.user:
+                return Response({'error': 'Not your connection'}, status=status.HTTP_403_FORBIDDEN)
+        except WellnessBuddy.DoesNotExist:
+            return Response({'error': 'Buddy not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        connection.delete()
+        return Response({'message': 'Buddy removed.'}, status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=False, methods=['get'])
+    def search(self, request):
+        """
+        Search for users to add as a wellness buddy.
+        GET /api/buddies/search/?q=username
+        """
+        query = request.query_params.get('q', '').strip()
+        if not query or len(query) < 2:
+            return Response({'error': 'Search query must be at least 2 characters.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        users = User.objects.filter(username__icontains=query).exclude(id=request.user.id)[:10]
+
+        # Exclude already-connected users
+        existing_ids = WellnessBuddy.objects.filter(
+            Q(user=request.user) | Q(buddy=request.user)
+        ).values_list('user_id', 'buddy_id')
+        connected_ids = set()
+        for uid, bid in existing_ids:
+            connected_ids.add(uid)
+            connected_ids.add(bid)
+
+        results = [
+            {
+                'id': u.id,
+                'username': u.username,
+                'name': u.get_full_name() or u.username,
+                'already_connected': u.id in connected_ids,
+            }
+            for u in users
+        ]
+        return Response({'results': results})

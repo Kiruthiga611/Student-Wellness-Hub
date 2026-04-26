@@ -2451,35 +2451,7 @@ class CrisisDetector:
         return detected_crises[0]
  
  
-# Add this to the end of the file:
-"""
-SETUP INSTRUCTIONS:
-===================
- 
-1. Add these models to your models.py
-2. Run migrations:
-   python manage.py makemigrations
-   python manage.py migrate
- 
-3. Seed crisis resources (see seed_crisis_resources.py)
- 
-4. Configure notification services in settings.py:
-   - Firebase for push notifications
-   - Email settings for email notifications
-   - Twilio for SMS notifications
- 
-5. Add crisis detection to mood entry save():
-   def save(self, *args, **kwargs):
-       super().save(*args, **kwargs)
-       
-       # Check for crisis
-       crisis = CrisisDetector.check_all(self.user)
-       if crisis:
-           # Trigger crisis intervention
-           trigger_crisis_intervention(self.user, crisis)
- 
-6. Test crisis flows in development before production!
-"""
+
 # ==================== PRIVACY SETTINGS ====================
  
 class UserPrivacySettings(models.Model):
