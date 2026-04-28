@@ -10,28 +10,37 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
+"""
+Django settings for mental_health_backend project.
+"""
+
 from datetime import timedelta
 from pathlib import Path
 from celery.schedules import crontab
 import os
+from dotenv import load_dotenv
 
-
-# Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-# Quick-start development settings - unsuitable for production
-# See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
+# ── BE-01 / S01: SECRET_KEY from env var — never hardcoded ───────────────────
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY')
+if not SECRET_KEY:
+    import sys
+    if 'test' in sys.argv or os.environ.get('CI'):
+        SECRET_KEY = 'django-insecure-test-only-not-for-production'
+    else:
+        raise RuntimeError(
+            "DJANGO_SECRET_KEY environment variable is not set.\n"
+            "Generate one: python -c \"from django.core.management.utils import "
+            "get_random_secret_key; print(get_random_secret_key())\""
+        )
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-!b%4zx0kd&p-&#dug0a&hq183+=lq*nv)resxmvtstpn_)e*7l'
+# ── BE-02 / S02: DEBUG from env var ──────────────────────────────────────────
+DEBUG = os.environ.get('DJANGO_DEBUG', 'False') == 'True'
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
-ALLOWED_HOSTS = ['localhost', '127.0.0.1']
-
-
-# Application definition
+# ── BE-07: ALLOWED_HOSTS from env var ────────────────────────────────────────
+ALLOWED_HOSTS = os.environ.get('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -40,14 +49,16 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'rest_framework',      # The API toolkit
-    'corsheaders',         # Allows React to talk to Django
+    'rest_framework',
+    'corsheaders',
     'mindset_api',
+    # NOTE BE-06: add 'mood' here if the mood scaffold is intentional
 ]
 
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',   # BE-13: static files in production
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -59,104 +70,89 @@ MIDDLEWARE = [
 
 ROOT_URLCONF = 'mental_health_backend.urls'
 
-TEMPLATES = [
-    {
-        'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
-        'APP_DIRS': True,
-        'OPTIONS': {
-            'context_processors': [
-                'django.template.context_processors.request',
-                'django.contrib.auth.context_processors.auth',
-                'django.contrib.messages.context_processors.messages',
-            ],
-        },
-    },
-]
+TEMPLATES = [{
+    'BACKEND': 'django.template.backends.django.DjangoTemplates',
+    'DIRS': [],
+    'APP_DIRS': True,
+    'OPTIONS': {'context_processors': [
+        'django.template.context_processors.request',
+        'django.contrib.auth.context_processors.auth',
+        'django.contrib.messages.context_processors.messages',
+    ]},
+}]
 
 WSGI_APPLICATION = 'mental_health_backend.wsgi.application'
 
-
-# Database
-# https://docs.djangoproject.com/en/6.0/ref/settings/#databases
-
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
-    }
-}
-
-
-# Password validation
-# https://docs.djangoproject.com/en/6.0/ref/settings/#auth-password-validators
+# ── BE-12: SQLite for dev, PostgreSQL for production ─────────────────────────
+_db_engine = os.environ.get('DB_ENGINE', 'django.db.backends.sqlite3')
+if _db_engine == 'django.db.backends.sqlite3':
+    DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': BASE_DIR / 'db.sqlite3'}}
+else:
+    DATABASES = {'default': {
+        'ENGINE': _db_engine,
+        'NAME': os.environ.get('DB_NAME', 'wellness_hub'),
+        'USER': os.environ.get('DB_USER', 'postgres'),
+        'PASSWORD': os.environ.get('DB_PASSWORD', ''),
+        'HOST': os.environ.get('DB_HOST', 'localhost'),
+        'PORT': os.environ.get('DB_PORT', '5432'),
+    }}
 
 AUTH_PASSWORD_VALIDATORS = [
-    {
-        'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
-    },
+    {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator'},
 ]
 
-
-# Internationalization
-# https://docs.djangoproject.com/en/6.0/topics/i18n/
-
 LANGUAGE_CODE = 'en-us'
-
 TIME_ZONE = 'UTC'
-
 USE_I18N = True
-
 USE_TZ = True
-
-
-# Static files (CSS, JavaScript, Images)
-# https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
 STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
-CORS_ALLOW_ALL_ORIGINS = True
+STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'  # BE-13
 
-# REST Framework & JWT Authentication
+# ── BE-03 / S03: CORS — only allow known origins ─────────────────────────────
+CORS_ALLOW_ALL_ORIGINS = False
+CORS_ALLOWED_ORIGINS = os.environ.get(
+    'CORS_ALLOWED_ORIGINS', 'http://localhost:5173,http://localhost:3000'
+).split(',')
+CORS_ALLOW_CREDENTIALS = True
+
 REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
-    ),
+    'DEFAULT_AUTHENTICATION_CLASSES': ('rest_framework_simplejwt.authentication.JWTAuthentication',),
     'EXCEPTION_HANDLER': 'mindset_api.exception_handlers.debug_aware_exception_handler',
 }
 
+# ── BE-04 / BE-05: Dedicated JWT key + 60-min access token ───────────────────
 SIMPLE_JWT = {
-    'SIGNING_KEY': SECRET_KEY,
-    'ACCESS_TOKEN_LIFETIME': timedelta(days=1),
+    'SIGNING_KEY': os.environ.get('JWT_SIGNING_KEY', SECRET_KEY),
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),   # was 1 day — fix BE-05
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
 }
-# ── Fix #12: Celery configuration ────────────────────────────────────────────
-# Broker: Redis running locally. Change the URL if you use a different broker.
+
+# ── BE-08 / Fix #12: Celery broker from env ───────────────────────────────────
+# Add to requirements.txt:  redis==5.2.0  gunicorn==23.0.0  whitenoise  psycopg2-binary
+# Start Redis locally:       docker run -d -p 6379:6379 redis:alpine
 CELERY_BROKER_URL = os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0')
 CELERY_RESULT_BACKEND = os.environ.get('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0')
 CELERY_TIMEZONE = TIME_ZONE
+
 CELERY_BEAT_SCHEDULE = {
-    # Send commitment reminders every hour
     'send-commitment-reminders': {
         'task': 'mindset_api.tasks.send_commitment_reminders',
-        'schedule': crontab(minute=0),  # Every hour at :00
+        'schedule': crontab(minute=0),
     },
-    
-    # Clean up old commitments daily at 3 AM
     'cleanup-old-commitments': {
         'task': 'mindset_api.tasks.cleanup_old_pending_commitments',
-        'schedule': crontab(hour=3, minute=0),  # 3:00 AM daily
+        'schedule': crontab(hour=3, minute=0),
     },
 }
+
+load_dotenv()
+
+SECRET_KEY = os.getenv('DJANGO_SECRET_KEY')
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')

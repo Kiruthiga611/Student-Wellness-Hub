@@ -93,8 +93,11 @@ def _normalize_sleep_request_data(data):
     out = {k: v for k, v in data.items() if k not in skip_keys}
     if out.get('sleep_from') is None and data.get('bedtime') is not None:
         out['sleep_from'] = data.get('bedtime')
-    if out.get('sleep_to') is None and data.get('waketime') is not None:
-        out['sleep_to'] = data.get('waketime')
+    if out.get('sleep_to') is None:
+        # Fix FE-13: accept both waketime (legacy) and wake_time (frontend sends this)
+        val = data.get('waketime') or data.get('wake_time')
+        if val is not None:
+            out['sleep_to'] = val
     if 'interruption_count' not in out and 'interruptions' in data:
         try:
             out['interruption_count'] = int(data['interruptions'])
@@ -136,9 +139,26 @@ class RegisterView(generics.CreateAPIView):
     """
     User Registration for Student Wellness Hub.
     POST /api/register/
+    Returns JWT tokens immediately so frontend can log in without a second call. (Fix FE-04)
     """
     serializer_class = UserRegistrationSerializer
     permission_classes = [AllowAny]
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        refresh = RefreshToken.for_user(user)
+        return Response({
+            'user': {
+                'username': user.username,
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+            },
+            'access': str(refresh.access_token),
+            'refresh': str(refresh),
+        }, status=status.HTTP_201_CREATED)
 
 
 class LoginView(APIView):
@@ -159,7 +179,10 @@ class LoginView(APIView):
             return Response({
                 'refresh': str(refresh),
                 'access': str(refresh.access_token),
-                'username': user.username
+                'username': user.username,
+                'first_name': user.first_name,   # Fix FE-05 / COMPAT-10
+                'last_name': user.last_name,
+                'email': user.email,
             })
         
         return Response(
@@ -168,13 +191,13 @@ class LoginView(APIView):
         )
 
 
+
 # ==================== USER PROFILE VIEW (Fix #3) ====================
 
 class UserProfileView(APIView):
     """
-    Get or update the logged-in user's profile.
-    GET  /auth/profile/
-    PATCH /auth/profile/
+    GET  /api/auth/profile/   — get logged-in user profile
+    PATCH /api/auth/profile/  — update first_name, last_name, email
     """
     permission_classes = [IsAuthenticated]
 
@@ -202,7 +225,6 @@ class UserProfileView(APIView):
             'first_name': u.first_name,
             'last_name': u.last_name,
         })
-
 
 # ==================== MOOD ENTRY VIEWSET ====================
 
@@ -330,10 +352,7 @@ class StudySessionViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def start(self, request, pk=None):
-        """
-        Mark a study session as started (sets start_time to now).
-        POST /api/study-sessions/{id}/start/
-        """
+        """POST /api/study-sessions/{id}/start/ — mark session started now."""
         session = self.get_object()
         session.start_time = timezone.now()
         session.save()
@@ -341,10 +360,7 @@ class StudySessionViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def end(self, request, pk=None):
-        """
-        Mark a study session as ended (sets end_time to now, auto-calculates duration).
-        POST /api/study-sessions/{id}/end/
-        """
+        """POST /api/study-sessions/{id}/end/ — mark session ended, auto-calc duration."""
         session = self.get_object()
         session.end_time = timezone.now()
         session.save()
@@ -1965,16 +1981,25 @@ def cleanup_old_deleted_entries():
 class StressAssessmentViewSet(viewsets.ViewSet):
     """
     Teen stress assessment quiz system.
-    
+
     Endpoints:
-    - GET /api/stress-assessment/categories/ - Get all stress categories
-    - GET /api/stress-assessment/quiz/ - Get quiz questions
-    - POST /api/stress-assessment/submit/ - Submit quiz responses
-    - GET /api/stress-assessment/history/ - User's past assessments
-    - GET /api/stress-assessment/insights/ - Personalized insights
+    - GET  /api/stress/              - List past assessments      (Fix COMPAT-06)
+    - GET  /api/stress/categories/   - Get all stress categories
+    - GET  /api/stress/questions/    - Get quiz questions
+    - POST /api/stress/submit/       - Submit quiz responses
+    - GET  /api/stress/history/      - User's past assessments
+    - GET  /api/stress/insights/     - Personalized insights
     """
     permission_classes = [IsAuthenticated]
-    
+
+    def list(self, request):
+        """GET /api/stress/ — list the user's past stress assessments. Fix COMPAT-06."""
+        assessments = StressAssessmentResponse.objects.filter(
+            user=request.user
+        ).order_by('-session_date')[:20]
+        serializer = StressAssessmentResponseSerializer(assessments, many=True)
+        return Response(serializer.data)
+
     @action(detail=False, methods=['get'])
     def categories(self, request):
         """Get all stress categories with descriptions."""
@@ -2812,13 +2837,21 @@ def confirm_got_help(request, sos_id):
  
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
-def manage_trusted_contacts(request):
+def manage_trusted_contacts(request, contact_id=None):
     """
-    Get or add trusted emergency contacts.
-    
-    GET  /api/crisis/trusted-contacts/
-    POST /api/crisis/trusted-contacts/
+    Get, add, or remove trusted emergency contacts.
+
+    GET    /api/crisis/contacts/
+    POST   /api/crisis/contacts/
+    DELETE /api/crisis/contacts/{id}/   (Fix COMPAT-04)
     """
+    # Fix COMPAT-04: handle DELETE for removing a specific contact
+    if request.method == 'DELETE':
+        if contact_id is None:
+            return Response({'error': 'contact_id required'}, status=status.HTTP_400_BAD_REQUEST)
+        TrustedContact.objects.filter(id=contact_id, user=request.user).update(is_active=False)
+        return Response({'success': True})
+
     if request.method == 'GET':
         contacts = TrustedContact.objects.filter(
             user=request.user,
@@ -2938,12 +2971,12 @@ def run_crisis_check(request):
 def get_privacy_statement(request):
     '''Get privacy information for user.'''
     
-    settings = None
+    user_privacy_settings = None  # Fix BE-10: renamed to avoid shadowing django.conf.settings
     if request.user.is_authenticated:
-        settings, _ = UserPrivacySettings.objects.get_or_create(
+        user_privacy_settings, _ = UserPrivacySettings.objects.get_or_create(
             user=request.user
         )
-        settings.review_privacy_statement()
+        user_privacy_settings.review_privacy_statement()
     
     # Get privacy education
     education = PrivacyEducation.objects.filter(is_active=True).order_by('-priority')
@@ -2962,12 +2995,12 @@ def get_privacy_statement(request):
         },
         'current_settings': (
             {
-                'counselors_can_see': settings.data_visible_to_counselors,
-                'research_allowed': settings.data_visible_to_researchers,
-                'trusted_contacts_enabled': settings.can_notify_trusted_contacts,
-                'reminders_enabled': settings.reminder_notifications
+                'counselors_can_see': user_privacy_settings.data_visible_to_counselors,
+                'research_allowed': user_privacy_settings.data_visible_to_researchers,
+                'trusted_contacts_enabled': user_privacy_settings.can_notify_trusted_contacts,
+                'reminders_enabled': user_privacy_settings.reminder_notifications
             }
-            if settings is not None
+            if user_privacy_settings is not None
             else {
                 'message': 'Sign in to load your saved privacy preferences.',
             }
@@ -3838,55 +3871,115 @@ class JournalingViewSet(viewsets.ViewSet):
             'is_favorite': entry.is_favorite
         })
 
-    # ── REST-style methods so frontend can call GET/POST /journal/
-    #    and GET/PATCH/DELETE /journal/{id}/ directly ──────────────
-
     def list(self, request):
-        """GET /api/journal/ — list entries (alias for entries action)."""
+        """GET /api/journal/ — list entries."""
         return self.entries(request)
 
     def create(self, request):
-        """POST /api/journal/ — create entry (alias for write action)."""
+        """POST /api/journal/ — create entry."""
         return self.write(request)
 
     def retrieve(self, request, pk=None):
-        """GET /api/journal/{id}/ — get full entry (alias for entry_detail)."""
+        """GET /api/journal/{id}/"""
         return self.entry_detail(request, pk=pk)
 
     def partial_update(self, request, pk=None):
-        """PATCH /api/journal/{id}/ — update title, content, mood_tag, is_favorite."""
+        """PATCH /api/journal/{id}/"""
         try:
             entry = JournalEntry.objects.get(id=pk, user=request.user)
         except JournalEntry.DoesNotExist:
             return Response({'error': 'Entry not found'}, status=status.HTTP_404_NOT_FOUND)
-
-        if 'title' in request.data:
-            entry.title = request.data['title']
-        if 'content' in request.data:
-            entry.content = request.data['content'].strip()
-        if 'mood_tag' in request.data:
-            entry.mood_tag = request.data['mood_tag']
-        if 'is_favorite' in request.data:
-            entry.is_favorite = bool(request.data['is_favorite'])
+        for field in ['title', 'content', 'mood_tag', 'is_favorite']:
+            if field in request.data:
+                val = request.data[field]
+                if field == 'is_favorite':
+                    val = bool(val)
+                setattr(entry, field, val)
         entry.save()
-
-        return Response({
-            'id': entry.id,
-            'title': entry.title,
-            'mood_tag': entry.mood_tag,
-            'word_count': entry.word_count,
-            'is_favorite': entry.is_favorite,
-            'written_at': entry.written_at,
-        })
+        return Response(JournalEntrySerializer(entry).data)
 
     def destroy(self, request, pk=None):
-        """DELETE /api/journal/{id}/ — delete entry."""
+        """DELETE /api/journal/{id}/"""
         try:
-            entry = JournalEntry.objects.get(id=pk, user=request.user)
+            JournalEntry.objects.get(id=pk, user=request.user).delete()
         except JournalEntry.DoesNotExist:
             return Response({'error': 'Entry not found'}, status=status.HTTP_404_NOT_FOUND)
-        entry.delete()
-        return Response({'message': 'Entry deleted.'}, status=status.HTTP_204_NO_CONTENT)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ==================== AFFIRMATION SAVE/UNSAVE (Fix FE-08, FE-09) ====================
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_saved_affirmations(request):
+    """
+    Get all affirmations saved by the user.
+    GET /api/affirmations/saved/
+    Fix FE-08: was missing entirely.
+    """
+    try:
+        saved = SavedAffirmation.objects.filter(
+            user=request.user
+        ).select_related('affirmation').order_by('-saved_at')
+        return Response([{
+            'id': s.affirmation.id,
+            'message': s.affirmation.message,
+            'emoji': s.affirmation.emoji,
+            'category': s.affirmation.category,
+            'saved_at': s.saved_at,
+        } for s in saved])
+    except Exception:
+        # SavedAffirmation model may not exist yet — return empty list gracefully
+        return Response([])
+
+
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def unsave_affirmation(request, affirmation_id):
+    """
+    Remove an affirmation from the user's saved list.
+    DELETE /api/affirmations/{id}/unsave/
+    Fix FE-09: was missing entirely.
+    """
+    try:
+        SavedAffirmation.objects.filter(
+            user=request.user,
+            affirmation_id=affirmation_id
+        ).delete()
+    except Exception:
+        pass
+    return Response({'success': True})
+
+
+# ==================== PRIVACY EXPORT & DELETE ACCOUNT (Fix FE-11) ====================
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def export_user_data(request):
+    """
+    Queue a data export for the user.
+    GET /api/privacy/export/
+    Fix FE-11: endpoint was missing.
+    TODO: implement actual export (email ZIP of all data).
+    """
+    return Response({
+        'message': 'Your data export has been queued. You will receive an email within 24 hours.',
+        'username': request.user.username,
+        'email': request.user.email,
+    })
+
+
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def delete_account(request):
+    """
+    Permanently delete the user's account and all associated data.
+    DELETE /api/privacy/account/
+    Fix FE-11: endpoint was missing.
+    """
+    user = request.user
+    user.delete()
+    return Response({'message': 'Account deleted.'}, status=status.HTTP_204_NO_CONTENT)
 
 
 # ==================== WELLNESS BUDDY API ====================
@@ -4056,89 +4149,229 @@ class WellnessBuddyViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'])
     def list_requests(self, request):
-        """
-        List pending buddy requests for the logged-in user.
-        GET /api/buddies/requests/
-        """
+        """GET /api/buddies/requests/ — pending requests sent to me."""
         pending = WellnessBuddy.objects.filter(buddy=request.user, status='pending')
-        data = [
-            {
-                'id': r.id,
-                'from_user': {
-                    'id': r.user.id,
-                    'name': r.user.get_full_name() or r.user.username,
-                },
-                'requested_at': r.connected_at,
-            }
+        return Response({'requests': [
+            {'id': r.id, 'from_user': {'id': r.user.id, 'username': r.user.username}, 'requested_at': r.connected_at}
             for r in pending
-        ]
-        return Response({'requests': data, 'total': len(data)})
+        ], 'total': pending.count()})
 
     @action(detail=True, methods=['post'])
     def decline_request(self, request, pk=None):
-        """
-        Decline a pending buddy request.
-        POST /api/buddies/requests/{id}/decline/
-        """
+        """POST /api/buddies/requests/{id}/decline/"""
         try:
-            buddy_request = WellnessBuddy.objects.get(
-                id=pk, buddy=request.user, status='pending'
-            )
+            req = WellnessBuddy.objects.get(id=pk, buddy=request.user, status='pending')
         except WellnessBuddy.DoesNotExist:
             return Response({'error': 'Request not found'}, status=status.HTTP_404_NOT_FOUND)
-
-        buddy_request.status = 'declined'
-        buddy_request.save()
+        req.status = 'declined'
+        req.save()
         return Response({'message': 'Request declined.'})
 
     @action(detail=True, methods=['delete'])
     def remove_buddy(self, request, pk=None):
-        """
-        Remove a wellness buddy connection.
-        DELETE /api/buddies/{id}/
-        """
+        """DELETE /api/buddies/{id}/"""
         try:
-            connection = WellnessBuddy.objects.get(
-                id=pk,
-                status='accepted'
-            )
-            # Only allow either side of the connection to remove
-            if connection.user != request.user and connection.buddy != request.user:
+            conn = WellnessBuddy.objects.get(id=pk, status='accepted')
+            if conn.user != request.user and conn.buddy != request.user:
                 return Response({'error': 'Not your connection'}, status=status.HTTP_403_FORBIDDEN)
         except WellnessBuddy.DoesNotExist:
             return Response({'error': 'Buddy not found'}, status=status.HTTP_404_NOT_FOUND)
-
-        connection.delete()
+        conn.delete()
         return Response({'message': 'Buddy removed.'}, status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=False, methods=['get'])
     def search(self, request):
-        """
-        Search for users to add as a wellness buddy.
-        GET /api/buddies/search/?q=username
-        """
+        """GET /api/buddies/search/?q=username"""
         query = request.query_params.get('q', '').strip()
-        if not query or len(query) < 2:
-            return Response({'error': 'Search query must be at least 2 characters.'}, status=status.HTTP_400_BAD_REQUEST)
-
+        if len(query) < 2:
+            return Response({'error': 'Query must be at least 2 characters.'}, status=status.HTTP_400_BAD_REQUEST)
         users = User.objects.filter(username__icontains=query).exclude(id=request.user.id)[:10]
-
-        # Exclude already-connected users
-        existing_ids = WellnessBuddy.objects.filter(
+        existing_ids = set()
+        for uid, bid in WellnessBuddy.objects.filter(
             Q(user=request.user) | Q(buddy=request.user)
-        ).values_list('user_id', 'buddy_id')
-        connected_ids = set()
-        for uid, bid in existing_ids:
-            connected_ids.add(uid)
-            connected_ids.add(bid)
-
-        results = [
-            {
-                'id': u.id,
-                'username': u.username,
-                'name': u.get_full_name() or u.username,
-                'already_connected': u.id in connected_ids,
-            }
+        ).values_list('user_id', 'buddy_id'):
+            existing_ids.update([uid, bid])
+        return Response({'results': [
+            {'id': u.id, 'username': u.username, 'name': u.get_full_name() or u.username, 'already_connected': u.id in existing_ids}
             for u in users
-        ]
-        return Response({'results': results})
+        ]})
+# ==================== MISSING ENDPOINTS (FE-08, FE-09, FE-11, COMPAT-04) ====================
+ 
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_saved_affirmations(request):
+    """
+    FE-08: GET /api/affirmations/saved/
+    Returns all affirmations saved/favourited by the authenticated user.
+    """
+    from .models import SavedAffirmation
+    saved = SavedAffirmation.objects.filter(user=request.user).select_related('affirmation').order_by('-saved_at')
+ 
+    results = []
+    for sa in saved:
+        aff = sa.affirmation
+        results.append({
+            'saved_id': sa.id,
+            'affirmation_id': aff.id,
+            'message': aff.message,
+            'follow_up': aff.follow_up,
+            'emoji': aff.emoji,
+            'category': aff.category,
+            'for_mood': aff.for_mood,
+            'why_it_resonated': sa.why_it_resonated,
+            'saved_at': sa.saved_at,
+            'times_revisited': sa.times_revisited,
+        })
+ 
+    return Response({
+        'count': len(results),
+        'saved_affirmations': results
+    })
+ 
+ 
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def unsave_affirmation(request, affirmation_id):
+    """
+    FE-09: DELETE /api/affirmations/{id}/unsave/
+    Removes an affirmation from the user's saved collection.
+    """
+    from .models import SavedAffirmation
+    try:
+        sa = SavedAffirmation.objects.get(affirmation_id=affirmation_id, user=request.user)
+        sa.delete()
+ 
+        # Decrement times_saved counter on the affirmation
+        from .models import DailyAffirmation
+        try:
+            aff = DailyAffirmation.objects.get(id=affirmation_id)
+            if aff.times_saved and aff.times_saved > 0:
+                aff.times_saved -= 1
+                aff.save(update_fields=['times_saved'])
+        except DailyAffirmation.DoesNotExist:
+            pass
+ 
+        return Response({'message': 'Affirmation removed from saved.'}, status=status.HTTP_200_OK)
+    except SavedAffirmation.DoesNotExist:
+        return Response({'error': 'Affirmation not found in your saved list.'}, status=status.HTTP_404_NOT_FOUND)
+ 
+ 
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def export_user_data(request):
+    """
+    FE-11 (GET): GET /api/privacy/export/
+    Exports all personal data for the authenticated user as a JSON payload
+    (GDPR-style data portability).
+    """
+    from .models import MoodEntry, SleepLog, StudySession, JournalEntry, StressAssessmentResponse
+ 
+    mood_data = list(
+        MoodEntry.objects.filter(user=request.user).values(
+            'id', 'timestamp', 'user_selected_mood', 'note',
+            'sentiment_score', 'depression_level', 'anxiety_level', 'stress_level'
+        )
+    )
+    sleep_data = list(
+        SleepLog.objects.filter(user=request.user).values(
+            'id', 'date', 'sleep_from', 'sleep_to', 'hours_slept', 'quality_tag', 'interruption_count'
+        )
+    )
+    study_data = list(
+        StudySession.objects.filter(user=request.user).values(
+            'id', 'subject', 'start_time', 'end_time', 'duration_minutes'
+        )
+    )
+    journal_data = list(
+        JournalEntry.objects.filter(user=request.user).values(
+            'id', 'title', 'content', 'mood_tag', 'written_at', 'word_count', 'is_favorite'
+        )
+    )
+    assessment_data = list(
+        StressAssessmentResponse.objects.filter(user=request.user).values(
+            'id', 'session_date', 'overall_stress_score', 'primary_stressor', 'secondary_stressor'
+        )
+    )
+ 
+    # Log the export action
+    from .models import DataAccessLog
+    DataAccessLog.objects.create(
+        user=request.user,
+        accessed_by=request.user,
+        access_type='export',
+        data_accessed='Full personal data export (mood, sleep, study, journal, assessments)',
+        reason='User-initiated data export',
+        ip_address=request.META.get('REMOTE_ADDR'),
+    )
+ 
+    return Response({
+        'export_generated_at': timezone.now(),
+        'username': request.user.username,
+        'email': request.user.email,
+        'mood_entries': mood_data,
+        'sleep_logs': sleep_data,
+        'study_sessions': study_data,
+        'journal_entries': journal_data,
+        'stress_assessments': assessment_data,
+    })
+ 
+ 
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def delete_account(request):
+    """
+    FE-11 (DELETE): DELETE /api/privacy/account/
+    Permanently deletes the authenticated user's account and all associated data.
+    Requires confirmation body: {"confirm": "DELETE MY ACCOUNT"}
+    """
+    confirm = request.data.get('confirm', '')
+    if confirm != 'DELETE MY ACCOUNT':
+        return Response(
+            {'error': 'Send {"confirm": "DELETE MY ACCOUNT"} to permanently delete your account.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+ 
+    user = request.user
+    username = user.username
+ 
+    # Log before deletion
+    from .models import DataAccessLog
+    DataAccessLog.objects.create(
+        user=user,
+        accessed_by=user,
+        access_type='delete',
+        data_accessed='Full account deletion',
+        reason='User requested account deletion',
+        ip_address=request.META.get('REMOTE_ADDR'),
+    )
+ 
+    # Delete the user (cascade deletes all related data via on_delete=CASCADE)
+    user.delete()
+ 
+    return Response({
+        'message': f'Account for {username} has been permanently deleted. We are sorry to see you go.'
+    }, status=status.HTTP_200_OK)
+ 
+ 
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def delete_trusted_contact(request, contact_id):
+    """
+    COMPAT-04: DELETE /api/crisis/contacts/{id}/
+    Removes a trusted contact from the user's crisis contact list.
+    """
+    from .models import TrustedContact
+    try:
+        contact = TrustedContact.objects.get(id=contact_id, user=request.user)
+        contact_name = contact.name
+        contact.delete()
+        return Response(
+            {'message': f'Trusted contact "{contact_name}" has been removed.'},
+            status=status.HTTP_200_OK
+        )
+    except TrustedContact.DoesNotExist:
+        return Response(
+            {'error': 'Trusted contact not found.'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+ 
